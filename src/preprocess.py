@@ -420,6 +420,541 @@ class FrameExtractor:
         return colmap_images_dir
 
 
+class DatasetAdapter:
+    """
+    Adapter for converting public dataset formats to pipeline format.
+
+    Supports:
+    - N3DV (Neural 3D Video): Multi-camera video sequences
+    - D-NeRF: Synthetic dynamic scenes
+    - LLFF: Forward-facing scenes with poses_bounds.npy
+    - Custom: Direct transforms.json format
+    """
+
+    # Known dataset signatures
+    DATASET_SIGNATURES = {
+        "n3dv": ["poses_bounds.npy", "cam00", "cam01"],
+        "dnerf": ["transforms_train.json", "transforms_test.json"],
+        "llff": ["poses_bounds.npy", "images"],
+        "nerf": ["transforms.json"],
+    }
+
+    def __init__(self):
+        """Initialize the dataset adapter."""
+        pass
+
+    def detect_dataset_type(self, input_dir: Path) -> Optional[str]:
+        """
+        Detect the type of dataset based on directory structure.
+
+        Args:
+            input_dir: Path to the input dataset directory
+
+        Returns:
+            Dataset type string, or None if unknown
+        """
+        input_dir = Path(input_dir)
+
+        if not input_dir.exists():
+            return None
+
+        files_and_dirs = [f.name for f in input_dir.iterdir()]
+
+        # Check for D-NeRF format first (most specific)
+        if "transforms_train.json" in files_and_dirs:
+            return "dnerf"
+
+        # Check for existing transforms.json (already in our format)
+        if "transforms.json" in files_and_dirs:
+            return None  # Already in correct format
+
+        # Check for N3DV multi-camera format
+        cam_dirs = [d for d in files_and_dirs if d.startswith("cam")]
+        if len(cam_dirs) >= 2:
+            return "n3dv"
+
+        # Check for LLFF format
+        if "poses_bounds.npy" in files_and_dirs:
+            return "llff"
+
+        return None
+
+    def adapt_dataset(
+        self,
+        input_dir: Path,
+        output_dir: Path,
+        dataset_type: str
+    ) -> Path:
+        """
+        Adapt a dataset to pipeline format.
+
+        Args:
+            input_dir: Input dataset directory
+            output_dir: Output directory for adapted data
+            dataset_type: Type of dataset ('n3dv', 'dnerf', 'llff')
+
+        Returns:
+            Path to the adapted dataset
+        """
+        input_dir = Path(input_dir)
+        output_dir = Path(output_dir)
+
+        if dataset_type == "n3dv":
+            return self.adapt_n3dv_dataset(input_dir, output_dir)
+        elif dataset_type == "dnerf":
+            return self.adapt_dnerf_dataset(input_dir, output_dir)
+        elif dataset_type == "llff":
+            return self.convert_llff_to_transforms(input_dir, output_dir)
+        else:
+            logger.warning(f"Unknown dataset type: {dataset_type}, copying as-is")
+            return self._copy_dataset(input_dir, output_dir)
+
+    def adapt_n3dv_dataset(
+        self,
+        input_dir: Path,
+        output_dir: Path
+    ) -> Path:
+        """
+        Adapt Neural 3D Video dataset format to pipeline format.
+
+        N3DV structure:
+            dataset/
+                cam00/
+                    images/
+                        000000.png
+                        000001.png
+                cam01/
+                    images/
+                poses_bounds.npy (optional, LLFF format)
+
+        Args:
+            input_dir: Input N3DV dataset directory
+            output_dir: Output directory
+
+        Returns:
+            Path to adapted dataset
+        """
+        import shutil
+        import numpy as np
+
+        input_dir = Path(input_dir)
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Find all camera directories
+        cam_dirs = sorted([
+            d for d in input_dir.iterdir()
+            if d.is_dir() and d.name.startswith("cam")
+        ])
+
+        if not cam_dirs:
+            logger.error("No camera directories found in N3DV dataset")
+            return input_dir
+
+        logger.info(f"Found {len(cam_dirs)} cameras in N3DV dataset")
+
+        # Check for poses_bounds.npy (LLFF format poses)
+        poses_file = input_dir / "poses_bounds.npy"
+        has_poses = poses_file.exists()
+
+        # Create images directory and gather all frames
+        images_dir = output_dir / "images"
+        images_dir.mkdir(exist_ok=True)
+
+        frames = []
+        cam_frame_counts = {}
+
+        for cam_dir in cam_dirs:
+            cam_name = cam_dir.name
+            cam_images_dir = cam_dir / "images"
+
+            if not cam_images_dir.exists():
+                cam_images_dir = cam_dir  # Images might be directly in cam dir
+
+            image_files = sorted(list(cam_images_dir.glob("*.png")) +
+                                list(cam_images_dir.glob("*.jpg")))
+
+            cam_frame_counts[cam_name] = len(image_files)
+
+            for i, img_path in enumerate(image_files):
+                # Create unique filename
+                new_name = f"{cam_name}_{img_path.name}"
+                new_path = images_dir / new_name
+
+                # Create symlink or copy
+                if new_path.exists():
+                    new_path.unlink()
+                new_path.symlink_to(img_path.resolve())
+
+                # Calculate time value (normalized 0-1)
+                total_frames = len(image_files)
+                time_val = i / max(1, total_frames - 1) if total_frames > 1 else 0.0
+
+                frames.append({
+                    "file_path": f"images/{new_name}",
+                    "time": time_val,
+                    "camera_id": int(cam_name.replace("cam", "")),
+                    "frame_id": i
+                })
+
+        # Load or generate camera poses
+        if has_poses:
+            transforms = self._load_llff_poses(poses_file, frames)
+        else:
+            logger.warning("No poses_bounds.npy found, generating placeholder poses")
+            transforms = self._generate_placeholder_poses(frames, len(cam_dirs))
+
+        # Save transforms.json
+        transforms_path = output_dir / "transforms.json"
+        with open(transforms_path, 'w') as f:
+            json.dump(transforms, f, indent=2)
+
+        logger.info(f"Adapted N3DV dataset: {len(frames)} frames from {len(cam_dirs)} cameras")
+        logger.info(f"Saved transforms to: {transforms_path}")
+
+        return output_dir
+
+    def adapt_dnerf_dataset(
+        self,
+        input_dir: Path,
+        output_dir: Path
+    ) -> Path:
+        """
+        Adapt D-NeRF dataset format to pipeline format.
+
+        D-NeRF structure:
+            dataset/
+                transforms_train.json
+                transforms_test.json
+                train/
+                    r_0.png
+                test/
+                    r_0.png
+
+        Args:
+            input_dir: Input D-NeRF dataset directory
+            output_dir: Output directory
+
+        Returns:
+            Path to adapted dataset
+        """
+        import shutil
+
+        input_dir = Path(input_dir)
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Load D-NeRF transforms
+        train_transforms_path = input_dir / "transforms_train.json"
+        test_transforms_path = input_dir / "transforms_test.json"
+
+        if not train_transforms_path.exists():
+            logger.error("transforms_train.json not found")
+            return input_dir
+
+        with open(train_transforms_path, 'r') as f:
+            train_transforms = json.load(f)
+
+        # Copy images directory structure
+        images_dir = output_dir / "images"
+        images_dir.mkdir(exist_ok=True)
+
+        # Process frames
+        frames = []
+        for frame in train_transforms.get("frames", []):
+            file_path = frame.get("file_path", "")
+
+            # Handle relative paths
+            if file_path.startswith("./"):
+                file_path = file_path[2:]
+
+            src_path = input_dir / file_path
+            if not src_path.suffix:
+                # Try common extensions
+                for ext in [".png", ".jpg", ".jpeg"]:
+                    if (input_dir / f"{file_path}{ext}").exists():
+                        src_path = input_dir / f"{file_path}{ext}"
+                        file_path = f"{file_path}{ext}"
+                        break
+
+            if src_path.exists():
+                # Copy or link image
+                dst_name = src_path.name
+                dst_path = images_dir / dst_name
+
+                if not dst_path.exists():
+                    shutil.copy(src_path, dst_path)
+
+                # Update frame data
+                new_frame = {
+                    "file_path": f"images/{dst_name}",
+                    "transform_matrix": frame.get("transform_matrix"),
+                    "time": frame.get("time", 0.0),
+                }
+                frames.append(new_frame)
+
+        # Build output transforms
+        transforms = {
+            "camera_angle_x": train_transforms.get("camera_angle_x", 0.8),
+            "camera_angle_y": train_transforms.get("camera_angle_y"),
+            "fl_x": train_transforms.get("fl_x"),
+            "fl_y": train_transforms.get("fl_y"),
+            "cx": train_transforms.get("cx"),
+            "cy": train_transforms.get("cy"),
+            "w": train_transforms.get("w", 800),
+            "h": train_transforms.get("h", 800),
+            "frames": frames
+        }
+
+        # Remove None values
+        transforms = {k: v for k, v in transforms.items() if v is not None}
+
+        # Save transforms.json
+        transforms_path = output_dir / "transforms.json"
+        with open(transforms_path, 'w') as f:
+            json.dump(transforms, f, indent=2)
+
+        logger.info(f"Adapted D-NeRF dataset: {len(frames)} frames")
+        logger.info(f"Saved transforms to: {transforms_path}")
+
+        return output_dir
+
+    def convert_llff_to_transforms(
+        self,
+        input_dir: Path,
+        output_dir: Path
+    ) -> Path:
+        """
+        Convert LLFF format (poses_bounds.npy) to transforms.json.
+
+        LLFF structure:
+            dataset/
+                images/
+                    image001.png
+                poses_bounds.npy (N x 17 array)
+
+        Args:
+            input_dir: Input LLFF dataset directory
+            output_dir: Output directory
+
+        Returns:
+            Path to converted dataset
+        """
+        import shutil
+        import numpy as np
+
+        input_dir = Path(input_dir)
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        poses_file = input_dir / "poses_bounds.npy"
+        if not poses_file.exists():
+            logger.error("poses_bounds.npy not found")
+            return input_dir
+
+        # Load poses
+        poses_arr = np.load(poses_file)
+        logger.info(f"Loaded poses_bounds.npy: shape {poses_arr.shape}")
+
+        # LLFF format: N x 17 (3x4 pose + 2 bounds + height/width/focal)
+        # Reshape to (N, 17)
+        if len(poses_arr.shape) == 2:
+            num_images = poses_arr.shape[0]
+        else:
+            poses_arr = poses_arr.reshape(-1, 17)
+            num_images = poses_arr.shape[0]
+
+        # Find images
+        images_dir = input_dir / "images"
+        if not images_dir.exists():
+            images_dir = input_dir
+
+        image_files = sorted(
+            list(images_dir.glob("*.png")) +
+            list(images_dir.glob("*.jpg")) +
+            list(images_dir.glob("*.jpeg"))
+        )
+
+        if len(image_files) != num_images:
+            logger.warning(
+                f"Image count ({len(image_files)}) != pose count ({num_images})"
+            )
+
+        # Create output images directory
+        out_images_dir = output_dir / "images"
+        out_images_dir.mkdir(exist_ok=True)
+
+        frames = []
+
+        for i in range(min(num_images, len(image_files))):
+            pose_data = poses_arr[i]
+
+            # Extract pose (3x4 -> 4x4)
+            pose = pose_data[:12].reshape(3, 4)
+            transform = np.eye(4)
+            transform[:3, :] = pose
+
+            # LLFF uses a different coordinate convention
+            # Convert from LLFF to standard NeRF coordinate system
+            transform = self._llff_to_nerf_pose(transform)
+
+            # Get bounds
+            near, far = pose_data[12], pose_data[13]
+
+            # Get intrinsics (height, width, focal)
+            h, w, focal = pose_data[14], pose_data[15], pose_data[16]
+
+            # Copy image
+            src_img = image_files[i]
+            dst_img = out_images_dir / src_img.name
+            if not dst_img.exists():
+                shutil.copy(src_img, dst_img)
+
+            frames.append({
+                "file_path": f"images/{src_img.name}",
+                "transform_matrix": transform.tolist(),
+                "near": float(near),
+                "far": float(far),
+                "time": i / max(1, num_images - 1)  # Normalized time
+            })
+
+        # Compute camera parameters from first image
+        h, w, focal = poses_arr[0, 14], poses_arr[0, 15], poses_arr[0, 16]
+        fov_x = 2 * np.arctan(w / (2 * focal))
+        fov_y = 2 * np.arctan(h / (2 * focal))
+
+        transforms = {
+            "camera_angle_x": float(fov_x),
+            "camera_angle_y": float(fov_y),
+            "fl_x": float(focal),
+            "fl_y": float(focal),
+            "cx": float(w / 2),
+            "cy": float(h / 2),
+            "w": int(w),
+            "h": int(h),
+            "frames": frames
+        }
+
+        # Save transforms
+        transforms_path = output_dir / "transforms.json"
+        with open(transforms_path, 'w') as f:
+            json.dump(transforms, f, indent=2)
+
+        logger.info(f"Converted LLFF dataset: {len(frames)} frames")
+        return output_dir
+
+    def _llff_to_nerf_pose(self, pose: 'np.ndarray') -> 'np.ndarray':
+        """Convert LLFF pose to NeRF coordinate convention."""
+        import numpy as np
+
+        # LLFF uses (x: right, y: up, z: backward)
+        # NeRF uses (x: right, y: up, z: forward)
+        # So we need to negate the z axis
+
+        # Also, LLFF stores camera-to-world, which is what we want
+        convert = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, -1, 0],
+            [0, 0, 0, 1]
+        ], dtype=np.float32)
+
+        return pose @ convert
+
+    def _load_llff_poses(
+        self,
+        poses_file: Path,
+        frames: list
+    ) -> dict:
+        """Load LLFF poses and apply to frames."""
+        import numpy as np
+
+        poses_arr = np.load(poses_file)
+        num_poses = poses_arr.shape[0]
+
+        # Get camera intrinsics from first pose
+        h, w, focal = poses_arr[0, 14], poses_arr[0, 15], poses_arr[0, 16]
+        fov_x = 2 * np.arctan(w / (2 * focal))
+
+        # Apply poses to frames (if possible)
+        for i, frame in enumerate(frames):
+            if i < num_poses:
+                pose = poses_arr[i, :12].reshape(3, 4)
+                transform = np.eye(4)
+                transform[:3, :] = pose
+                transform = self._llff_to_nerf_pose(transform)
+                frame["transform_matrix"] = transform.tolist()
+
+        transforms = {
+            "camera_angle_x": float(fov_x),
+            "fl_x": float(focal),
+            "fl_y": float(focal),
+            "cx": float(w / 2),
+            "cy": float(h / 2),
+            "w": int(w),
+            "h": int(h),
+            "frames": frames
+        }
+
+        return transforms
+
+    def _generate_placeholder_poses(
+        self,
+        frames: list,
+        num_cameras: int
+    ) -> dict:
+        """Generate placeholder poses when no pose data is available."""
+        import numpy as np
+
+        # Create camera ring around origin
+        for i, frame in enumerate(frames):
+            cam_id = frame.get("camera_id", i % num_cameras)
+            angle = (cam_id / num_cameras) * 2 * np.pi
+            radius = 4.0
+
+            # Camera position
+            cam_x = radius * np.cos(angle)
+            cam_y = 0.5
+            cam_z = radius * np.sin(angle)
+
+            # Look at origin
+            forward = np.array([0, 0, 0]) - np.array([cam_x, cam_y, cam_z])
+            forward = forward / np.linalg.norm(forward)
+
+            up = np.array([0, 1, 0])
+            right = np.cross(forward, up)
+            right = right / np.linalg.norm(right)
+            up = np.cross(right, forward)
+
+            transform = np.eye(4)
+            transform[:3, 0] = right
+            transform[:3, 1] = up
+            transform[:3, 2] = -forward
+            transform[:3, 3] = [cam_x, cam_y, cam_z]
+
+            frame["transform_matrix"] = transform.tolist()
+
+        transforms = {
+            "camera_angle_x": 0.8,  # ~45 degrees
+            "frames": frames
+        }
+
+        return transforms
+
+    def _copy_dataset(self, input_dir: Path, output_dir: Path) -> Path:
+        """Copy dataset as-is when no adaptation is needed."""
+        import shutil
+
+        if input_dir == output_dir:
+            return output_dir
+
+        if output_dir.exists():
+            shutil.rmtree(output_dir)
+
+        shutil.copytree(input_dir, output_dir)
+        return output_dir
+
+
 def main():
     """CLI entry point for testing frame extraction."""
     import argparse
