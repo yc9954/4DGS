@@ -1,0 +1,94 @@
+# 4D Gaussian Splatting Pipeline - Git Ignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.spyderproject
+.spyproject
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb
+
+# Testing
+.coverage
+htmlcov/
+.tox/
+.pytest_cache/
+.mypy_cache/
+
+# Data directories (large files)
+data/inputs/
+data/processed/
+data/outputs/
+
+# But keep the directory structure
+!data/inputs/.gitkeep
+!data/processed/.gitkeep
+!data/outputs/.gitkeep
+
+# COLMAP outputs
+*.db
+*.db-journal
+sparse/
+dense/
+
+# Model outputs
+*.ply
+*.pth
+point_cloud/
+
+# Rendered outputs
+*.mp4
+*.avi
+*.mov
+*.webm
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Secrets and config overrides
+.env
+*.local.yaml
+secrets.yaml

@@ -1,0 +1,83 @@
+# 4D Gaussian Splatting Pipeline - Default Configuration
+# =====================================================
+# Copy this file and modify for your experiments
+
+# === Paths ===
+# project_root: .  # Will be auto-detected
+input_dir: data/inputs
+processed_dir: data/processed
+output_dir: data/outputs
+
+# === Experiment ===
+experiment_name: experiment_001
+skip_existing: true  # Skip steps if output already exists
+verbose: true
+
+# === Frame Extraction ===
+frame_extraction:
+  fps: 30.0                    # Frames per second to extract
+  quality: 95                  # Output quality (1-100 for jpg, compression level for png)
+  format: png                  # Output format: 'png' or 'jpg'
+  start_time: 0.0              # Start time in seconds
+  duration: null               # Duration to extract (null = full video)
+  resize_width: null           # Resize width (null = original)
+  resize_height: null          # Resize height (null = original)
+
+# === COLMAP Settings ===
+colmap:
+  # Camera model options: SIMPLE_PINHOLE, PINHOLE, OPENCV, OPENCV_FISHEYE
+  camera_model: OPENCV
+
+  # For multi-camera setup, use same intrinsics per camera folder
+  single_camera: false
+  single_camera_per_folder: true
+
+  # Matcher type: 'exhaustive' (best for few views), 'sequential' (for videos)
+  matcher_type: exhaustive
+
+  # GPU settings
+  use_gpu: true
+  gpu_index: 0
+
+  # Quality settings
+  max_image_size: 3200         # Maximum image dimension for feature extraction
+  num_threads: -1              # -1 = use all available
+
+# === Training Settings ===
+training:
+  iterations: 30000            # Total training iterations
+
+  # Checkpoint iterations
+  save_iterations:
+    - 7000
+    - 15000
+    - 30000
+
+  # Evaluation iterations
+  test_iterations:
+    - 7000
+    - 15000
+    - 30000
+
+  # Resolution (-1 = use original)
+  resolution: -1
+
+  # Background color
+  white_background: false
+
+# === Rendering Settings ===
+render:
+  output_format: mp4           # Output video format
+  fps: 30                      # Output video FPS
+  codec: libx264               # Video codec
+  crf: 18                      # Quality (lower = better, 18 is visually lossless)
+
+  # Camera path type: 'interpolate', 'spiral', 'orbit'
+  camera_path_type: interpolate
+
+  # Number of frames to render
+  num_frames: 300
+
+  # Custom resolution (null = use training resolution)
+  width: null
+  height: null

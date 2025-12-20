@@ -1,0 +1,38 @@
+# 4D Gaussian Splatting MVP Pipeline - Requirements
+# Core dependencies for the data pipeline and automation wrapper
+
+# PyTorch (install with CUDA support for GPU acceleration)
+# Install via: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Computer Vision
+opencv-python>=4.8.0
+opencv-python-headless>=4.8.0  # For headless servers
+Pillow>=10.0.0
+
+# Scientific Computing
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Data Processing
+tqdm>=4.65.0  # Progress bars
+colorama>=0.4.6  # Colored terminal output
+
+# Configuration and CLI
+pyyaml>=6.0
+argparse  # Built-in, but listed for clarity
+
+# Logging and Utilities
+loguru>=0.7.0  # Better logging
+
+# Optional: For visualization and debugging
+matplotlib>=3.7.0
+plotly>=5.15.0
+
+# Optional: For parallel processing
+joblib>=1.3.0
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
