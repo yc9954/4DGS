@@ -65,6 +65,25 @@ class ColmapWrapper:
             )
         logger.debug("COLMAP found")
 
+    def _get_headless_env(self) -> Dict[str, str]:
+        """
+        Get environment variables for headless COLMAP operation.
+
+        Returns:
+            Dictionary of environment variables
+        """
+        import os
+        env = os.environ.copy()
+
+        # Disable display for headless operation (RunPod/cloud environments)
+        env['QT_QPA_PLATFORM'] = 'offscreen'
+        env['DISPLAY'] = ''
+
+        # Set COLMAP database cache size for better memory management
+        env['COLMAP_DATABASE_CACHE_SIZE'] = '256'
+
+        return env
+
     def _run_colmap(
         self,
         command: str,
@@ -73,6 +92,8 @@ class ColmapWrapper:
     ) -> subprocess.CompletedProcess:
         """
         Execute a COLMAP command with the given arguments.
+
+        Runs in headless mode suitable for cloud/server environments without X11.
 
         Args:
             command: COLMAP command to run
@@ -92,10 +113,14 @@ class ColmapWrapper:
 
         start_time = time.time()
 
+        # Use headless environment
+        env = self._get_headless_env()
+
         result = subprocess.run(
             cmd,
             capture_output=True,
-            text=True
+            text=True,
+            env=env
         )
 
         elapsed = time.time() - start_time
@@ -103,6 +128,9 @@ class ColmapWrapper:
         if result.returncode != 0:
             logger.error(f"{step_name} failed after {elapsed:.1f}s")
             logger.error(f"STDERR: {result.stderr}")
+            # Also log stdout as it may contain useful info
+            if result.stdout:
+                logger.debug(f"STDOUT: {result.stdout}")
             raise RuntimeError(f"COLMAP {command} failed:\n{result.stderr}")
 
         logger.info(f"{step_name} completed in {elapsed:.1f}s")

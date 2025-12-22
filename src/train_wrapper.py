@@ -69,24 +69,51 @@ class TrainWrapper:
     - Monitoring training progress
     - Handling checkpoints and outputs
     - Graceful error handling and recovery
+
+    Default engine: hustvl/4DGaussians (installed in submodules/4dgs/)
     """
 
     # Supported 4DGS implementations
     SUPPORTED_METHODS = {
         "4dgs": {
-            "repo": "fudan-zvg/4d-gaussian-splatting",
+            "repo": "hustvl/4DGaussians",
             "train_script": "train.py",
             "required_args": ["source_path", "model_path"],
+            "arg_mapping": {
+                "source_path": "-s",
+                "model_path": "-m",
+            },
+            "extra_args": [],
         },
         "4dgaussians": {
             "repo": "hustvl/4DGaussians",
             "train_script": "train.py",
             "required_args": ["source_path", "model_path"],
+            "arg_mapping": {
+                "source_path": "-s",
+                "model_path": "-m",
+            },
+            "extra_args": [],
+        },
+        "fudan": {
+            "repo": "fudan-zvg/4d-gaussian-splatting",
+            "train_script": "train.py",
+            "required_args": ["source_path", "model_path"],
+            "arg_mapping": {
+                "source_path": "--source_path",
+                "model_path": "--model_path",
+            },
+            "extra_args": [],
         },
         "custom": {
             "repo": None,
             "train_script": "train.py",
             "required_args": ["source_path", "model_path"],
+            "arg_mapping": {
+                "source_path": "--source_path",
+                "model_path": "--model_path",
+            },
+            "extra_args": [],
         }
     }
 
@@ -101,7 +128,7 @@ class TrainWrapper:
 
         Args:
             config: Pipeline configuration object
-            method: Training method to use ('4dgs', '4dgaussians', 'custom')
+            method: Training method to use ('4dgs', '4dgaussians', 'fudan', 'custom')
             method_path: Path to the training method code (if custom/local)
         """
         self.config = config
@@ -119,37 +146,80 @@ class TrainWrapper:
         self.progress = TrainingProgress()
         self._process: Optional[subprocess.Popen] = None
         self._log_file: Optional[Path] = None
+        self._method_dir: Optional[Path] = None
+
+    def _get_project_root(self) -> Path:
+        """Get the project root directory."""
+        # Start from this file and go up to find project root
+        current = Path(__file__).resolve().parent.parent
+        markers = ["main.py", "requirements.txt", ".git"]
+        for _ in range(5):
+            if any((current / marker).exists() for marker in markers):
+                return current
+            current = current.parent
+        return Path.cwd()
 
     def _find_train_script(self) -> Path:
         """
         Find the training script for the selected method.
 
+        For hustvl/4DGaussians (default), looks in:
+        - submodules/4dgs/train.py
+        - submodules/4DGaussians/train.py
+        - external/4dgs/train.py
+
         Returns:
             Path to the training script
         """
+        project_root = self._get_project_root()
+
         if self.method_path:
             script = self.method_path / self.method_info["train_script"]
             if script.exists():
+                self._method_dir = self.method_path
                 return script
             raise FileNotFoundError(f"Training script not found: {script}")
 
-        # Check common locations
+        # Check common locations for the 4DGS submodule
         possible_paths = [
-            Path("./submodules") / self.method / self.method_info["train_script"],
-            Path("./external") / self.method / self.method_info["train_script"],
-            Path("./third_party") / self.method / self.method_info["train_script"],
-            Path(".") / self.method_info["train_script"],
+            # Primary location for hustvl/4DGaussians
+            project_root / "submodules" / "4dgs" / self.method_info["train_script"],
+            project_root / "submodules" / "4DGaussians" / self.method_info["train_script"],
+            project_root / "submodules" / "4d-gaussian-splatting" / self.method_info["train_script"],
+            # Alternative locations
+            project_root / "external" / "4dgs" / self.method_info["train_script"],
+            project_root / "external" / "4DGaussians" / self.method_info["train_script"],
+            project_root / "third_party" / "4dgs" / self.method_info["train_script"],
+            project_root / "third_party" / "4DGaussians" / self.method_info["train_script"],
+            # Method-specific subdirectory
+            project_root / "submodules" / self.method / self.method_info["train_script"],
+            # Current directory fallback
+            project_root / self.method_info["train_script"],
         ]
 
         for path in possible_paths:
             if path.exists():
+                self._method_dir = path.parent
+                logger.info(f"Found training script at: {path}")
                 return path
 
-        raise FileNotFoundError(
-            f"Could not find training script for {self.method}. "
-            f"Tried: {[str(p) for p in possible_paths]}\n"
-            f"Please specify method_path or ensure the training code is installed."
+        # Provide helpful error message
+        error_msg = (
+            f"Could not find training script for {self.method}.\n"
+            f"Searched locations:\n"
         )
+        for p in possible_paths[:6]:  # Show first 6 paths
+            error_msg += f"  - {p}\n"
+
+        error_msg += (
+            f"\nTo fix this, either:\n"
+            f"1. Clone the 4DGS repository:\n"
+            f"   git clone https://github.com/hustvl/4DGaussians.git submodules/4dgs\n"
+            f"2. Or specify a custom path:\n"
+            f"   --method_path /path/to/4dgs"
+        )
+
+        raise FileNotFoundError(error_msg)
 
     def _build_train_command(
         self,
@@ -159,6 +229,15 @@ class TrainWrapper:
     ) -> List[str]:
         """
         Build the training command with all arguments.
+
+        Uses the arg_mapping from method_info to generate the correct
+        command-line arguments for the specific 4DGS implementation.
+
+        For hustvl/4DGaussians:
+            python train.py -s <source_path> -m <model_path> --iterations <n>
+
+        For fudan/4d-gaussian-splatting:
+            python train.py --source_path <path> --model_path <path>
 
         Args:
             source_path: Path to the training data
@@ -170,11 +249,16 @@ class TrainWrapper:
         """
         train_script = self._find_train_script()
 
+        # Get argument mapping for this method
+        arg_mapping = self.method_info.get("arg_mapping", {})
+        source_arg = arg_mapping.get("source_path", "--source_path")
+        model_arg = arg_mapping.get("model_path", "--model_path")
+
         cmd = [
             sys.executable,  # Use current Python interpreter
             str(train_script),
-            "--source_path", str(source_path),
-            "--model_path", str(model_path),
+            source_arg, str(source_path),
+            model_arg, str(model_path),
         ]
 
         # Add training configuration
@@ -182,15 +266,24 @@ class TrainWrapper:
             "--iterations", str(self.train_config.iterations),
         ])
 
-        # Save iterations
+        # Save iterations - hustvl uses space-separated list
         if self.train_config.save_iterations:
-            save_iters = " ".join(str(i) for i in self.train_config.save_iterations)
-            cmd.extend(["--save_iterations", save_iters])
+            if self.method in ["4dgs", "4dgaussians"]:
+                # hustvl/4DGaussians format
+                for iteration in self.train_config.save_iterations:
+                    cmd.extend(["--save_iterations", str(iteration)])
+            else:
+                save_iters = " ".join(str(i) for i in self.train_config.save_iterations)
+                cmd.extend(["--save_iterations", save_iters])
 
         # Test iterations
         if self.train_config.test_iterations:
-            test_iters = " ".join(str(i) for i in self.train_config.test_iterations)
-            cmd.extend(["--test_iterations", test_iters])
+            if self.method in ["4dgs", "4dgaussians"]:
+                for iteration in self.train_config.test_iterations:
+                    cmd.extend(["--test_iterations", str(iteration)])
+            else:
+                test_iters = " ".join(str(i) for i in self.train_config.test_iterations)
+                cmd.extend(["--test_iterations", test_iters])
 
         # Resolution
         if self.train_config.resolution != -1:
@@ -199,6 +292,10 @@ class TrainWrapper:
         # Background color
         if self.train_config.white_background:
             cmd.append("--white_background")
+
+        # Add method-specific extra arguments
+        for extra_arg in self.method_info.get("extra_args", []):
+            cmd.append(extra_arg)
 
         # Add any additional keyword arguments
         for key, value in kwargs.items():
@@ -209,6 +306,27 @@ class TrainWrapper:
                 cmd.extend([f"--{key}", str(value)])
 
         return cmd
+
+    def _get_method_env(self) -> Dict[str, str]:
+        """
+        Get environment variables for the training subprocess.
+
+        Adds the method directory to PYTHONPATH for proper imports.
+
+        Returns:
+            Dictionary of environment variables
+        """
+        env = os.environ.copy()
+
+        # Add the method directory to PYTHONPATH
+        if self._method_dir:
+            existing_path = env.get("PYTHONPATH", "")
+            if existing_path:
+                env["PYTHONPATH"] = f"{self._method_dir}:{existing_path}"
+            else:
+                env["PYTHONPATH"] = str(self._method_dir)
+
+        return env
 
     def _parse_log_line(self, line: str) -> Optional[Dict[str, Any]]:
         """
@@ -359,6 +477,12 @@ class TrainWrapper:
         # Start training process
         start_time = time.time()
 
+        # Get environment with PYTHONPATH set for the method
+        env = self._get_method_env()
+
+        # Set working directory to method directory for relative imports
+        cwd = self._method_dir if self._method_dir else None
+
         try:
             self._process = subprocess.Popen(
                 cmd,
@@ -366,7 +490,9 @@ class TrainWrapper:
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
-                universal_newlines=True
+                universal_newlines=True,
+                env=env,
+                cwd=cwd
             )
 
             # Start output monitoring thread

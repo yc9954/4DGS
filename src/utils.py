@@ -367,6 +367,199 @@ class ProgressTracker:
             )
 
 
+def compress_output(
+    source_dir: Union[str, Path],
+    output_path: Optional[Union[str, Path]] = None,
+    format: str = "tar.gz",
+    exclude_patterns: Optional[List[str]] = None
+) -> Path:
+    """
+    Compress the output directory for easy downloading from cloud environments.
+
+    Args:
+        source_dir: Directory to compress
+        output_path: Output archive path (auto-generated if None)
+        format: Archive format ('tar.gz', 'zip', 'tar.bz2')
+        exclude_patterns: List of glob patterns to exclude
+
+    Returns:
+        Path to the created archive
+
+    Example:
+        >>> compress_output('data/outputs/my_experiment')
+        PosixPath('data/outputs/my_experiment.tar.gz')
+    """
+    import tarfile
+    import zipfile
+
+    source_dir = Path(source_dir)
+    if not source_dir.exists():
+        raise FileNotFoundError(f"Source directory not found: {source_dir}")
+
+    # Generate output path if not specified
+    if output_path is None:
+        if format == "zip":
+            output_path = source_dir.parent / f"{source_dir.name}.zip"
+        elif format == "tar.bz2":
+            output_path = source_dir.parent / f"{source_dir.name}.tar.bz2"
+        else:
+            output_path = source_dir.parent / f"{source_dir.name}.tar.gz"
+    else:
+        output_path = Path(output_path)
+
+    # Default exclude patterns for 4DGS outputs
+    if exclude_patterns is None:
+        exclude_patterns = [
+            "*.log",
+            "__pycache__",
+            "*.pyc",
+            ".git",
+        ]
+
+    def should_exclude(path: Path) -> bool:
+        """Check if path matches any exclude pattern."""
+        import fnmatch
+        for pattern in exclude_patterns:
+            if fnmatch.fnmatch(path.name, pattern):
+                return True
+            if fnmatch.fnmatch(str(path), f"*/{pattern}/*"):
+                return True
+        return False
+
+    logger.info(f"Compressing {source_dir} to {output_path}...")
+
+    if format == "zip":
+        # Create ZIP archive
+        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for file_path in source_dir.rglob('*'):
+                if file_path.is_file() and not should_exclude(file_path):
+                    arcname = file_path.relative_to(source_dir.parent)
+                    zipf.write(file_path, arcname)
+                    logger.debug(f"  Added: {arcname}")
+    else:
+        # Create TAR archive (gzip or bzip2)
+        mode = 'w:gz' if format == "tar.gz" else 'w:bz2'
+        with tarfile.open(output_path, mode) as tar:
+            for file_path in source_dir.rglob('*'):
+                if not should_exclude(file_path):
+                    arcname = file_path.relative_to(source_dir.parent)
+                    tar.add(file_path, arcname=arcname)
+                    logger.debug(f"  Added: {arcname}")
+
+    # Get archive size
+    archive_size = output_path.stat().st_size
+    size_mb = archive_size / (1024 * 1024)
+    logger.info(f"Archive created: {output_path} ({size_mb:.1f} MB)")
+
+    return output_path
+
+
+def extract_archive(
+    archive_path: Union[str, Path],
+    output_dir: Optional[Union[str, Path]] = None
+) -> Path:
+    """
+    Extract an archive file.
+
+    Args:
+        archive_path: Path to the archive file
+        output_dir: Directory to extract to (uses archive parent if None)
+
+    Returns:
+        Path to the extraction directory
+    """
+    import tarfile
+    import zipfile
+
+    archive_path = Path(archive_path)
+    if not archive_path.exists():
+        raise FileNotFoundError(f"Archive not found: {archive_path}")
+
+    if output_dir is None:
+        output_dir = archive_path.parent
+    else:
+        output_dir = Path(output_dir)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info(f"Extracting {archive_path} to {output_dir}...")
+
+    if archive_path.suffix == '.zip':
+        with zipfile.ZipFile(archive_path, 'r') as zipf:
+            zipf.extractall(output_dir)
+    elif archive_path.name.endswith('.tar.gz') or archive_path.name.endswith('.tgz'):
+        with tarfile.open(archive_path, 'r:gz') as tar:
+            tar.extractall(output_dir)
+    elif archive_path.name.endswith('.tar.bz2'):
+        with tarfile.open(archive_path, 'r:bz2') as tar:
+            tar.extractall(output_dir)
+    elif archive_path.suffix == '.tar':
+        with tarfile.open(archive_path, 'r') as tar:
+            tar.extractall(output_dir)
+    else:
+        raise ValueError(f"Unsupported archive format: {archive_path}")
+
+    logger.info(f"Extraction complete: {output_dir}")
+    return output_dir
+
+
+def download_file(
+    url: str,
+    output_path: Union[str, Path],
+    show_progress: bool = True,
+    chunk_size: int = 8192
+) -> Path:
+    """
+    Download a file from URL with progress reporting.
+
+    Args:
+        url: URL to download from
+        output_path: Local path to save the file
+        show_progress: Show download progress bar
+        chunk_size: Download chunk size
+
+    Returns:
+        Path to the downloaded file
+    """
+    import urllib.request
+    import urllib.error
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    logger.info(f"Downloading: {url}")
+
+    try:
+        # Get file size if available
+        with urllib.request.urlopen(url) as response:
+            total_size = int(response.headers.get('content-length', 0))
+
+            if show_progress and total_size > 0:
+                from tqdm import tqdm
+                with tqdm(total=total_size, unit='B', unit_scale=True, desc=output_path.name) as pbar:
+                    with open(output_path, 'wb') as f:
+                        while True:
+                            chunk = response.read(chunk_size)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            pbar.update(len(chunk))
+            else:
+                with open(output_path, 'wb') as f:
+                    while True:
+                        chunk = response.read(chunk_size)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+
+    except urllib.error.URLError as e:
+        logger.error(f"Download failed: {e}")
+        raise
+
+    logger.info(f"Downloaded: {output_path}")
+    return output_path
+
+
 if __name__ == "__main__":
     # Print system info when run directly
     print_system_info()

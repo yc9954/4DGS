@@ -50,19 +50,38 @@ class Pipeline:
     Main 4DGS Pipeline orchestrator.
 
     Coordinates all pipeline steps from raw video input to final rendering.
+    Supports cloud environments (RunPod) and public datasets with existing poses.
     """
 
     # Pipeline step definitions
     STEPS = ["preprocess", "colmap", "convert", "train", "render"]
 
-    def __init__(self, config: PipelineConfig):
+    def __init__(
+        self,
+        config: PipelineConfig,
+        skip_colmap: bool = False,
+        method: str = "4dgs",
+        method_path: Optional[Path] = None,
+        adapt_dataset: str = "auto",
+        compress_outputs: bool = False
+    ):
         """
         Initialize the pipeline.
 
         Args:
             config: Pipeline configuration object
+            skip_colmap: If True, skip preprocessing and COLMAP steps
+            method: Training method to use ('4dgs', '4dgaussians', 'fudan', 'custom')
+            method_path: Path to training method code (for custom methods)
+            adapt_dataset: Dataset adapter to use ('none', 'n3dv', 'dnerf', 'llff', 'auto')
+            compress_outputs: If True, compress outputs after rendering
         """
         self.config = config
+        self.skip_colmap = skip_colmap
+        self.method = method
+        self.method_path = method_path
+        self.adapt_dataset = adapt_dataset
+        self.compress_outputs = compress_outputs
 
         # Initialize components (lazy loading)
         self._frame_extractor: Optional[FrameExtractor] = None
@@ -115,7 +134,11 @@ class Pipeline:
     def train_wrapper(self) -> TrainWrapper:
         """Get or create training wrapper instance."""
         if self._train_wrapper is None:
-            self._train_wrapper = TrainWrapper(self.config)
+            self._train_wrapper = TrainWrapper(
+                self.config,
+                method=self.method,
+                method_path=self.method_path
+            )
         return self._train_wrapper
 
     @property
@@ -124,6 +147,87 @@ class Pipeline:
         if self._render_wrapper is None:
             self._render_wrapper = RenderWrapper(self.config)
         return self._render_wrapper
+
+    def _check_transforms_exists(self) -> bool:
+        """
+        Check if transforms.json already exists in the input directory.
+
+        This is used to skip COLMAP steps for datasets that already have poses.
+
+        Returns:
+            True if transforms.json exists
+        """
+        # Check in input directory
+        input_transforms = self.config.input_dir / "transforms.json"
+        if input_transforms.exists():
+            logger.info(f"Found existing transforms.json at: {input_transforms}")
+            return True
+
+        # Check in experiment directory
+        exp_transforms = self.config.get_experiment_dir() / "transforms.json"
+        if exp_transforms.exists():
+            logger.info(f"Found existing transforms.json at: {exp_transforms}")
+            return True
+
+        return False
+
+    def _should_skip_colmap(self) -> bool:
+        """
+        Determine if COLMAP steps should be skipped.
+
+        Returns:
+            True if COLMAP should be skipped
+        """
+        # Explicitly requested
+        if self.skip_colmap:
+            logger.info("Skipping COLMAP (--skip_colmap flag set)")
+            return True
+
+        # transforms.json already exists
+        if self._check_transforms_exists():
+            logger.info("Skipping COLMAP (transforms.json already exists)")
+            return True
+
+        return False
+
+    def step_adapt_dataset(self) -> Optional[Path]:
+        """
+        Adapt public dataset format to pipeline format.
+
+        Returns:
+            Path to adapted data, or None if no adaptation needed
+        """
+        logger.info("=" * 60)
+        logger.info("STEP 0: DATASET ADAPTATION")
+        logger.info("=" * 60)
+
+        from src.preprocess import DatasetAdapter
+
+        adapter = DatasetAdapter()
+
+        # Detect dataset type if auto
+        if self.adapt_dataset == "auto":
+            dataset_type = adapter.detect_dataset_type(self.config.input_dir)
+            if dataset_type:
+                logger.info(f"Detected dataset type: {dataset_type}")
+            else:
+                logger.info("No special dataset format detected, using as-is")
+                return None
+        elif self.adapt_dataset == "none":
+            return None
+        else:
+            dataset_type = self.adapt_dataset
+
+        # Perform adaptation
+        output_dir = self.config.get_experiment_dir()
+        adapted_path = adapter.adapt_dataset(
+            self.config.input_dir,
+            output_dir,
+            dataset_type
+        )
+
+        logger.info(f"Dataset adapted to: {adapted_path}")
+        return adapted_path
 
     def step_preprocess(self) -> dict:
         """
@@ -313,7 +417,7 @@ class Pipeline:
             Dictionary with results from each step
         """
         if steps is None:
-            steps = self.STEPS
+            steps = self.STEPS.copy()
 
         # Validate steps
         for step in steps:
@@ -325,12 +429,17 @@ class Pipeline:
         # Create output directories
         self.config.create_directories()
 
+        # Check if we should skip COLMAP-related steps
+        skip_colmap_steps = self._should_skip_colmap()
+
         logger.info("=" * 60)
         logger.info("4D GAUSSIAN SPLATTING PIPELINE")
         logger.info("=" * 60)
         logger.info(f"Experiment: {self.config.experiment_name}")
         logger.info(f"Input: {self.config.input_dir}")
         logger.info(f"Output: {self.config.output_dir}")
+        logger.info(f"Training Method: {self.method}")
+        logger.info(f"Skip COLMAP: {skip_colmap_steps}")
         logger.info(f"Steps: {steps}")
         logger.info("=" * 60)
 
@@ -338,15 +447,34 @@ class Pipeline:
         start_time = datetime.now()
 
         try:
+            # Dataset adaptation (for public datasets)
+            if self.adapt_dataset != "none":
+                adapted = self.step_adapt_dataset()
+                if adapted:
+                    results["adapt"] = adapted
+
+            # Preprocessing steps
             if "preprocess" in steps:
-                results["preprocess"] = self.step_preprocess()
+                if skip_colmap_steps:
+                    logger.info("Skipping preprocessing (COLMAP skip mode)")
+                    # Copy transforms.json if needed
+                    self._copy_transforms_if_needed()
+                else:
+                    results["preprocess"] = self.step_preprocess()
 
             if "colmap" in steps:
-                results["colmap"] = self.step_colmap()
+                if skip_colmap_steps:
+                    logger.info("Skipping COLMAP (COLMAP skip mode)")
+                else:
+                    results["colmap"] = self.step_colmap()
 
             if "convert" in steps:
-                results["convert"] = self.step_convert()
+                if skip_colmap_steps:
+                    logger.info("Skipping conversion (COLMAP skip mode)")
+                else:
+                    results["convert"] = self.step_convert()
 
+            # Training and rendering (always run if requested)
             if "train" in steps:
                 results["train"] = self.step_train(mock=mock_training)
 
@@ -354,6 +482,10 @@ class Pipeline:
                 results["render"] = self.step_render()
 
             elapsed = datetime.now() - start_time
+
+            # Compress outputs if requested
+            if self.compress_outputs:
+                self._compress_outputs()
 
             logger.info("=" * 60)
             logger.info("PIPELINE COMPLETED SUCCESSFULLY")
@@ -365,6 +497,35 @@ class Pipeline:
             raise
 
         return results
+
+    def _copy_transforms_if_needed(self):
+        """Copy transforms.json from input to experiment directory if needed."""
+        import shutil
+
+        input_transforms = self.config.input_dir / "transforms.json"
+        exp_transforms = self.config.get_experiment_dir() / "transforms.json"
+
+        if input_transforms.exists() and not exp_transforms.exists():
+            logger.info(f"Copying transforms.json to experiment directory")
+            exp_transforms.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(input_transforms, exp_transforms)
+
+            # Also copy images directory if it exists
+            input_images = self.config.input_dir / "images"
+            if input_images.exists():
+                exp_images = self.config.get_experiment_dir() / "images"
+                if not exp_images.exists():
+                    shutil.copytree(input_images, exp_images)
+                    logger.info(f"Copied images directory to experiment directory")
+
+    def _compress_outputs(self):
+        """Compress the output directory for easy download."""
+        from src.utils import compress_output
+
+        output_dir = self.config.get_render_dir()
+        if output_dir.exists():
+            archive_path = compress_output(output_dir.parent)
+            logger.info(f"Outputs compressed to: {archive_path}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -496,6 +657,38 @@ Examples:
         help="Don't skip existing outputs, reprocess everything"
     )
 
+    # Cloud/dataset options
+    parser.add_argument(
+        "--skip_colmap",
+        action="store_true",
+        help="Skip COLMAP steps (for datasets with existing poses/transforms.json)"
+    )
+    parser.add_argument(
+        "--method",
+        type=str,
+        choices=["4dgs", "4dgaussians", "fudan", "custom"],
+        default="4dgs",
+        help="4DGS training method (default: 4dgs/hustvl)"
+    )
+    parser.add_argument(
+        "--method_path",
+        type=Path,
+        default=None,
+        help="Path to the training method code (for custom methods)"
+    )
+    parser.add_argument(
+        "--adapt_dataset",
+        type=str,
+        choices=["none", "n3dv", "dnerf", "llff", "auto"],
+        default="auto",
+        help="Dataset adapter to use (auto-detects if not specified)"
+    )
+    parser.add_argument(
+        "--compress",
+        action="store_true",
+        help="Compress outputs after rendering (for cloud environments)"
+    )
+
     return parser.parse_args()
 
 
@@ -561,7 +754,14 @@ def main():
             sys.exit(1)
 
     # Create and run pipeline
-    pipeline = Pipeline(config)
+    pipeline = Pipeline(
+        config,
+        skip_colmap=getattr(args, 'skip_colmap', False),
+        method=getattr(args, 'method', '4dgs'),
+        method_path=getattr(args, 'method_path', None),
+        adapt_dataset=getattr(args, 'adapt_dataset', 'auto'),
+        compress_outputs=getattr(args, 'compress', False)
+    )
 
     try:
         results = pipeline.run(
