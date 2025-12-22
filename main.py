@@ -190,6 +190,30 @@ class Pipeline:
 
         return False
 
+    def _link_images_for_training(self):
+        """
+        [CRITICAL FIX]
+        Create a symlink 'images' in experiment dir pointing to 'colmap/images'.
+        Required because transforms.json expects './images/...' but our pipeline
+        stores extracted frames in 'colmap/images'.
+        """
+        import shutil
+
+        exp_dir = self.config.get_experiment_dir()
+        target_images = exp_dir / "images"
+        source_images = exp_dir / "colmap" / "images"
+
+        # Only link if source exists and target doesn't
+        if source_images.exists() and not target_images.exists():
+            try:
+                # Use absolute paths for symlink to avoid relative path issues
+                target_images.symlink_to(source_images.resolve())
+                logger.info(f"Created symlink for training: {target_images} -> {source_images}")
+            except OSError as e:
+                logger.warning(f"Could not create symlink (copying instead): {e}")
+                if source_images.is_dir():
+                    shutil.copytree(source_images, target_images)
+
     def step_adapt_dataset(self) -> Optional[Path]:
         """
         Adapt public dataset format to pipeline format.
@@ -245,6 +269,9 @@ class Pipeline:
 
         # Create symlinks for COLMAP
         self.frame_extractor.create_frame_symlinks(results)
+
+        # [FIX] Create 'images' symlink so training script can find frames
+        self._link_images_for_training()
 
         logger.info(f"Extracted frames from {len(results)} cameras")
 
