@@ -143,9 +143,46 @@ setup_python_env() {
 
     # Ensure pip is up to date
     log_info "Upgrading pip..."
-    python3 -m pip install --upgrade pip
+    python3 -m pip install --upgrade pip setuptools wheel
 
-    # Install Python dependencies
+    # Detect CUDA version and install appropriate PyTorch
+    log_info "Detecting CUDA version for PyTorch installation..."
+
+    CUDA_VERSION=""
+    if command -v nvcc &> /dev/null; then
+        CUDA_VERSION=$(nvcc --version | grep "release" | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p')
+    elif [ -f /usr/local/cuda/version.txt ]; then
+        CUDA_VERSION=$(cat /usr/local/cuda/version.txt | sed -n 's/.*CUDA Version \([0-9]*\.[0-9]*\).*/\1/p')
+    fi
+
+    log_info "Detected CUDA version: ${CUDA_VERSION:-unknown}"
+
+    # Install PyTorch based on CUDA version
+    # RTX 4090 typically uses CUDA 11.8 or 12.x
+    if [[ "$CUDA_VERSION" == 12.* ]]; then
+        log_info "Installing PyTorch for CUDA 12.1..."
+        python3 -m pip install torch==2.1.0+cu121 torchvision==0.16.0+cu121 torchaudio==2.1.0+cu121 \
+            --extra-index-url https://download.pytorch.org/whl/cu121
+    elif [[ "$CUDA_VERSION" == 11.8* ]] || [[ "$CUDA_VERSION" == "" ]]; then
+        # Default: CUDA 11.8 (most compatible with RTX 4090)
+        log_info "Installing PyTorch for CUDA 11.8 (RTX 4090 compatible)..."
+        python3 -m pip install torch==2.0.1+cu118 torchvision==0.15.2+cu118 torchaudio==2.0.2+cu118 \
+            --extra-index-url https://download.pytorch.org/whl/cu118
+    elif [[ "$CUDA_VERSION" == 11.7* ]]; then
+        log_info "Installing PyTorch for CUDA 11.7..."
+        python3 -m pip install torch==2.0.1+cu117 torchvision==0.15.2+cu117 torchaudio==2.0.2+cu117 \
+            --extra-index-url https://download.pytorch.org/whl/cu117
+    elif [[ "$CUDA_VERSION" == 11.6* ]]; then
+        log_info "Installing PyTorch 1.13.1 for CUDA 11.6 (4DGaussians native)..."
+        python3 -m pip install torch==1.13.1+cu116 torchvision==0.14.1+cu116 torchaudio==0.13.1+cu116 \
+            --extra-index-url https://download.pytorch.org/whl/cu116
+    else
+        log_warn "Unknown CUDA version, installing latest PyTorch with CUDA 11.8..."
+        python3 -m pip install torch torchvision torchaudio \
+            --extra-index-url https://download.pytorch.org/whl/cu118
+    fi
+
+    # Install other Python dependencies
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     REQUIREMENTS_FILE="$SCRIPT_DIR/requirements.txt"
 
@@ -155,13 +192,23 @@ setup_python_env() {
     else
         log_warn "requirements.txt not found at $REQUIREMENTS_FILE"
         log_info "Installing core dependencies manually..."
-        python3 -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
         python3 -m pip install numpy scipy opencv-python-headless pillow tqdm loguru pyyaml
+        python3 -m pip install mmcv==1.6.0 lpips plyfile pytorch_msssim open3d imageio[ffmpeg]
     fi
 
     # Verify PyTorch CUDA availability
     log_info "Verifying PyTorch CUDA availability..."
-    python3 -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA version: {torch.version.cuda if torch.cuda.is_available() else \"N/A\"}'); print(f'GPU count: {torch.cuda.device_count()}')" || log_warn "Could not verify PyTorch CUDA"
+    python3 -c "
+import torch
+print(f'PyTorch version: {torch.__version__}')
+print(f'CUDA available: {torch.cuda.is_available()}')
+if torch.cuda.is_available():
+    print(f'CUDA version: {torch.version.cuda}')
+    print(f'GPU count: {torch.cuda.device_count()}')
+    print(f'GPU name: {torch.cuda.get_device_name(0)}')
+else:
+    print('WARNING: CUDA is not available!')
+" || log_warn "Could not verify PyTorch CUDA"
 
     log_info "Python environment setup complete."
 }
