@@ -14,9 +14,6 @@
 
 set -e  # Exit on error
 
-# Initialize sudo command variable (will be set by check_permissions)
-SUDO_CMD=""
-
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -44,19 +41,23 @@ log_section() {
     echo -e "${BLUE}============================================================${NC}"
 }
 
+# Determine if we need sudo (RunPod runs as root, so no sudo needed)
+SUDO=""
+if [ "$EUID" -ne 0 ]; then
+    if command -v sudo &> /dev/null; then
+        SUDO="sudo"
+    else
+        log_error "Not running as root and sudo is not available."
+        exit 1
+    fi
+fi
+
 # Check if running as root or with sudo
-# Set SUDO_CMD to "sudo" if not root, empty if root
 check_permissions() {
     if [ "$EUID" -eq 0 ]; then
-        SUDO_CMD=""
-        log_info "Running as root - sudo not needed."
-    elif sudo -n true 2>/dev/null; then
-        SUDO_CMD="sudo"
-        log_info "Running with sudo privileges."
-    else
-        SUDO_CMD="sudo"
-        log_warn "This script may require sudo for some operations."
-        log_info "You may be prompted for your password."
+        log_info "Running as root (no sudo needed)"
+    elif [ -n "$SUDO" ]; then
+        log_info "Using sudo for privileged operations"
     fi
 }
 
@@ -68,11 +69,11 @@ install_system_packages() {
 
     # Update package lists
     log_info "Updating apt package lists..."
-    ${SUDO_CMD} apt-get update -qq
+    $SUDO apt-get update -qq
 
     # Install core dependencies
     log_info "Installing core dependencies..."
-    ${SUDO_CMD} apt-get install -y --no-install-recommends \
+    $SUDO apt-get install -y --no-install-recommends \
         build-essential \
         cmake \
         git \
@@ -84,11 +85,11 @@ install_system_packages() {
 
     # Install FFmpeg
     log_info "Installing FFmpeg..."
-    ${SUDO_CMD} apt-get install -y ffmpeg
+    $SUDO apt-get install -y ffmpeg
 
     # Install OpenCV dependencies (headless)
     log_info "Installing OpenCV/OpenGL dependencies..."
-    ${SUDO_CMD} apt-get install -y \
+    $SUDO apt-get install -y \
         libgl1-mesa-glx \
         libglib2.0-0 \
         libsm6 \
@@ -98,7 +99,7 @@ install_system_packages() {
 
     # Install COLMAP and its dependencies
     log_info "Installing COLMAP..."
-    ${SUDO_CMD} apt-get install -y colmap
+    $SUDO apt-get install -y colmap
 
     log_info "System packages installed successfully."
 }
@@ -154,7 +155,7 @@ setup_python_env() {
 
     # Ensure pip is up to date
     log_info "Upgrading pip..."
-    python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel
+    python3 -m pip install --upgrade pip setuptools wheel
 
     # Detect CUDA version and install appropriate PyTorch
     log_info "Detecting CUDA version for PyTorch installation..."
@@ -172,24 +173,24 @@ setup_python_env() {
     # RTX 4090 typically uses CUDA 11.8 or 12.x
     if [[ "$CUDA_VERSION" == 12.* ]]; then
         log_info "Installing PyTorch for CUDA 12.1..."
-        python3 -m pip install --no-cache-dir torch==2.1.0+cu121 torchvision==0.16.0+cu121 torchaudio==2.1.0+cu121 \
+        python3 -m pip install torch==2.1.0+cu121 torchvision==0.16.0+cu121 torchaudio==2.1.0+cu121 \
             --extra-index-url https://download.pytorch.org/whl/cu121
     elif [[ "$CUDA_VERSION" == 11.8* ]] || [[ "$CUDA_VERSION" == "" ]]; then
         # Default: CUDA 11.8 (most compatible with RTX 4090)
         log_info "Installing PyTorch for CUDA 11.8 (RTX 4090 compatible)..."
-        python3 -m pip install --no-cache-dir torch==2.0.1+cu118 torchvision==0.15.2+cu118 torchaudio==2.0.2+cu118 \
+        python3 -m pip install torch==2.0.1+cu118 torchvision==0.15.2+cu118 torchaudio==2.0.2+cu118 \
             --extra-index-url https://download.pytorch.org/whl/cu118
     elif [[ "$CUDA_VERSION" == 11.7* ]]; then
         log_info "Installing PyTorch for CUDA 11.7..."
-        python3 -m pip install --no-cache-dir torch==2.0.1+cu117 torchvision==0.15.2+cu117 torchaudio==2.0.2+cu117 \
+        python3 -m pip install torch==2.0.1+cu117 torchvision==0.15.2+cu117 torchaudio==2.0.2+cu117 \
             --extra-index-url https://download.pytorch.org/whl/cu117
     elif [[ "$CUDA_VERSION" == 11.6* ]]; then
         log_info "Installing PyTorch 1.13.1 for CUDA 11.6 (4DGaussians native)..."
-        python3 -m pip install --no-cache-dir torch==1.13.1+cu116 torchvision==0.14.1+cu116 torchaudio==0.13.1+cu116 \
+        python3 -m pip install torch==1.13.1+cu116 torchvision==0.14.1+cu116 torchaudio==0.13.1+cu116 \
             --extra-index-url https://download.pytorch.org/whl/cu116
     else
         log_warn "Unknown CUDA version, installing latest PyTorch with CUDA 11.8..."
-        python3 -m pip install --no-cache-dir torch torchvision torchaudio \
+        python3 -m pip install torch torchvision torchaudio \
             --extra-index-url https://download.pytorch.org/whl/cu118
     fi
 
@@ -199,12 +200,12 @@ setup_python_env() {
 
     if [ -f "$REQUIREMENTS_FILE" ]; then
         log_info "Installing Python dependencies from requirements.txt..."
-        python3 -m pip install --no-cache-dir --ignore-installed -r "$REQUIREMENTS_FILE"
+        python3 -m pip install -r "$REQUIREMENTS_FILE"
     else
         log_warn "requirements.txt not found at $REQUIREMENTS_FILE"
         log_info "Installing core dependencies manually..."
-        python3 -m pip install --no-cache-dir --ignore-installed numpy scipy opencv-python-headless pillow tqdm loguru pyyaml
-        python3 -m pip install --no-cache-dir --ignore-installed mmcv==1.6.0 lpips plyfile pytorch_msssim open3d imageio[ffmpeg]
+        python3 -m pip install numpy scipy opencv-python-headless pillow tqdm loguru pyyaml
+        python3 -m pip install mmcv==1.6.0 lpips plyfile pytorch_msssim open3d imageio[ffmpeg]
     fi
 
     # Verify PyTorch CUDA availability
@@ -257,7 +258,7 @@ setup_submodules() {
             # Install 4DGS dependencies
             if [ -f "submodules/4dgs/requirements.txt" ]; then
                 log_info "Installing 4DGS dependencies..."
-                python3 -m pip install --no-cache-dir --ignore-installed -r submodules/4dgs/requirements.txt
+                python3 -m pip install -r submodules/4dgs/requirements.txt
             fi
 
             # Build custom CUDA extensions if setup.py exists
@@ -286,7 +287,7 @@ build_cuda_extensions() {
     if [ -d "$RASTERIZER_DIR" ]; then
         log_info "Building diff-gaussian-rasterization..."
         cd "$RASTERIZER_DIR"
-        python3 -m pip install --no-cache-dir --ignore-installed -e .
+        python3 -m pip install -e .
         cd "$SCRIPT_DIR"
     fi
 
@@ -295,7 +296,7 @@ build_cuda_extensions() {
     if [ -d "$SIMPLE_KNN_DIR" ]; then
         log_info "Building simple-knn..."
         cd "$SIMPLE_KNN_DIR"
-        python3 -m pip install --no-cache-dir --ignore-installed -e .
+        python3 -m pip install -e .
         cd "$SCRIPT_DIR"
     fi
 
