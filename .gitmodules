@@ -1,0 +1,4 @@
+[submodule "submodules/4dgs"]
+	path = submodules/4dgs
+	url = https://github.com/hustvl/4DGaussians.git
+	branch = master
