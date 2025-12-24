@@ -1,0 +1,4 @@
+EXPERIMENT_NAME=sample_synthetic_test
+LAST_STEP=render
+STATUS=failed
+TIMESTAMP=2025-12-24T01:23:25+00:00

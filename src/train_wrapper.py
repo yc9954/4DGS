@@ -19,6 +19,7 @@ import time
 import threading
 import json
 from pathlib import Path
+from pathlib import Path
 from typing import Optional, List, Dict, Any, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -321,10 +322,24 @@ class TrainWrapper:
         # Add the method directory to PYTHONPATH
         if self._method_dir:
             existing_path = env.get("PYTHONPATH", "")
+            paths_to_add = [str(self._method_dir)]
+            
+            # Add CUDA extension paths for 4DGS
+            if "4dgs" in str(self._method_dir).lower():
+                method_path = Path(self._method_dir)
+                # Add depth-diff-gaussian-rasterization
+                rasterizer_path = method_path / "submodules" / "depth-diff-gaussian-rasterization"
+                if rasterizer_path.exists():
+                    paths_to_add.append(str(rasterizer_path))
+                # Add simple-knn
+                knn_path = method_path / "submodules" / "simple-knn"
+                if knn_path.exists():
+                    paths_to_add.append(str(knn_path))
+            
             if existing_path:
-                env["PYTHONPATH"] = f"{self._method_dir}:{existing_path}"
+                env["PYTHONPATH"] = ":".join(paths_to_add + [existing_path])
             else:
-                env["PYTHONPATH"] = str(self._method_dir)
+                env["PYTHONPATH"] = ":".join(paths_to_add)
 
         return env
 

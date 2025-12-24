@@ -10,6 +10,7 @@ import sys
 import shutil
 import json
 import math
+import os
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass
@@ -394,6 +395,7 @@ class RenderWrapper:
         self.render_config = config.render
         self.method = method
         self.method_path = method_path
+        self._method_dir = None
 
         self._check_ffmpeg()
 
@@ -404,6 +406,41 @@ class RenderWrapper:
                 "FFmpeg not found. Video encoding will not be available. "
                 "Install FFmpeg to enable video output."
             )
+
+    def _get_method_env(self) -> Dict[str, str]:
+        """
+        Get environment variables for the rendering subprocess.
+        
+        Adds the method directory to PYTHONPATH for proper imports.
+        
+        Returns:
+            Dictionary of environment variables
+        """
+        env = os.environ.copy()
+        
+        # Add the method directory to PYTHONPATH
+        if self._method_dir:
+            existing_path = env.get("PYTHONPATH", "")
+            paths_to_add = [str(self._method_dir)]
+            
+            # Add CUDA extension paths for 4DGS
+            if "4dgs" in str(self._method_dir).lower():
+                method_path = Path(self._method_dir)
+                # Add depth-diff-gaussian-rasterization
+                rasterizer_path = method_path / "submodules" / "depth-diff-gaussian-rasterization"
+                if rasterizer_path.exists():
+                    paths_to_add.append(str(rasterizer_path))
+                # Add simple-knn
+                knn_path = method_path / "submodules" / "simple-knn"
+                if knn_path.exists():
+                    paths_to_add.append(str(knn_path))
+            
+            if existing_path:
+                env["PYTHONPATH"] = ":".join(paths_to_add + [existing_path])
+            else:
+                env["PYTHONPATH"] = ":".join(paths_to_add)
+        
+        return env
 
     def _find_render_script(self) -> Path:
         """Find the rendering script for the selected method."""
@@ -431,7 +468,8 @@ class RenderWrapper:
         model_path: Path,
         camera_path: CameraPath,
         output_dir: Path,
-        iteration: Optional[int] = None
+        iteration: Optional[int] = None,
+        source_path: Optional[Path] = None
     ) -> Path:
         """
         Render a camera path using the trained model.
@@ -441,6 +479,7 @@ class RenderWrapper:
             camera_path: Camera path to render
             output_dir: Directory to save rendered frames
             iteration: Checkpoint iteration to use (None = latest)
+            source_path: Path to original dataset (for finding transforms_train.json)
 
         Returns:
             Path to the rendered frames directory
@@ -453,15 +492,36 @@ class RenderWrapper:
 
         # Find render script
         render_script = self._find_render_script()
+        
+        # Set method_dir for PYTHONPATH
+        if not self._method_dir:
+            self._method_dir = render_script.parent
 
-        # Build command
+        # Build command - convert paths to absolute for reliability
+        abs_model_path = Path(model_path).resolve()
+        abs_output_dir = Path(output_dir).resolve()
+        
+        # Use source_path if provided (for finding transforms_train.json), otherwise try to find it
+        if source_path is None:
+            # Try to find the original dataset path from model_path
+            # Usually it's in data/processed/{experiment_name}/
+            possible_source = abs_model_path.parent.parent.parent / "processed" / abs_model_path.parent.name
+            if (possible_source / "transforms_train.json").exists():
+                source_path = possible_source
+            else:
+                source_path = abs_output_dir
+        
+        abs_source_path = Path(source_path).resolve()
+        
         cmd = [
             sys.executable,
             str(render_script),
-            "--model_path", str(model_path),
-            "--source_path", str(output_dir),  # Where transforms.json is
+            "--model_path", str(abs_model_path),
+            "--source_path", str(abs_source_path),  # Original dataset path with transforms_train.json
             "--skip_train",
             "--skip_test",
+            "--render_path", str(path_file),  # Custom camera path
+            "--output_dir", str(abs_output_dir),  # Output directory for rendered frames
         ]
 
         if iteration:
@@ -469,16 +529,36 @@ class RenderWrapper:
 
         logger.info(f"Rendering {len(camera_path.transforms)} frames...")
         logger.debug(f"Command: {' '.join(cmd)}")
-
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        # Get environment with PYTHONPATH set for the method
+        env = self._get_method_env()
+        
+        # Set working directory to project root for relative paths
+        # Find project root (where main.py is located)
+        project_root = Path(__file__).parent.parent.parent
+        if not (project_root / "main.py").exists():
+            project_root = Path.cwd()
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=project_root)
 
         if result.returncode != 0:
             logger.error(f"Render failed: {result.stderr}")
             raise RuntimeError(f"Rendering failed: {result.stderr}")
 
         logger.info(f"Rendered frames saved to {output_dir}")
-
-        return output_dir
+        
+        # render_set saves to model_path/name/ours_{iteration}/renders
+        # So we need to find the actual render directory
+        # Try to find the renders directory
+        actual_iteration = iteration or 30000
+        actual_render_dir = output_dir / "render" / f"ours_{actual_iteration}" / "renders"
+        
+        if actual_render_dir.exists() and any(actual_render_dir.glob("*.png")):
+            logger.info(f"Found rendered frames in: {actual_render_dir}")
+            return actual_render_dir
+        else:
+            logger.warning(f"Could not find rendered frames in {actual_render_dir}, returning {output_dir}")
+            return output_dir
 
     def frames_to_video(
         self,
@@ -641,14 +721,17 @@ class RenderWrapper:
         render_dir = self.config.get_render_dir()
         frames_dir = render_dir / "frames"
 
-        # Render
-        self.render_path(model_path, camera_path, frames_dir)
+        # Find source path for rendering (where transforms_train.json is)
+        source_path = training_transforms.parent if training_transforms else None
+
+        # Render - this returns the actual directory where frames were saved
+        actual_frames_dir = self.render_path(model_path, camera_path, frames_dir, source_path=source_path)
 
         # Encode video
         if output_video is None:
             output_video = render_dir / f"render_{path_type}.{self.render_config.output_format}"
 
-        return self.frames_to_video(frames_dir, output_video)
+        return self.frames_to_video(actual_frames_dir, output_video)
 
 
 class MockRenderWrapper(RenderWrapper):
@@ -661,7 +744,8 @@ class MockRenderWrapper(RenderWrapper):
         model_path: Path,
         camera_path: CameraPath,
         output_dir: Path,
-        iteration: Optional[int] = None
+        iteration: Optional[int] = None,
+        source_path: Optional[Path] = None
     ) -> Path:
         """Simulate rendering."""
         output_dir.mkdir(parents=True, exist_ok=True)

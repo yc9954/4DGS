@@ -147,12 +147,19 @@ get_resume_step_index() {
 # Step Detection Functions
 # ============================================================================
 check_transforms_exists() {
-    local experiment_dir="$1"
-    local transforms_file="$experiment_dir/transforms.json"
+    local input_dir="$1"
+    local transforms_file="$input_dir/transforms.json"
 
-    if [ -f "$transforms_file" ]; then
+    if [ ! -f "$transforms_file" ]; then
+        return 1
+    fi
+
+    # Check if transforms.json has valid frames data
+    if python3 -c "import json; data = json.load(open('$transforms_file')); exit(0 if data.get('frames') and len(data.get('frames', [])) > 0 else 1)" 2>/dev/null; then
         return 0
     fi
+
+    # transforms.json exists but has no frames - COLMAP needed
     return 1
 }
 
@@ -197,24 +204,28 @@ run_step() {
             ;;
         colmap)
             python3 main.py \
+                --input "$input_folder" \
                 --experiment "$experiment_name" \
                 --step colmap \
                 $extra_args
             ;;
         convert)
             python3 main.py \
+                --input "$input_folder" \
                 --experiment "$experiment_name" \
                 --step convert \
                 $extra_args
             ;;
         train)
             python3 main.py \
+                --input "$input_folder" \
                 --experiment "$experiment_name" \
                 --step train \
                 $extra_args
             ;;
         render)
             python3 main.py \
+                --input "$input_folder" \
                 --experiment "$experiment_name" \
                 --step render \
                 $extra_args
@@ -410,6 +421,15 @@ main() {
     if [ ! -d "$INPUT_FOLDER" ] && [ "$SKIP_COLMAP" = "false" ]; then
         log_error "Input folder does not exist: $INPUT_FOLDER"
         exit 1
+    fi
+
+    # Auto-detect if COLMAP should be skipped (transforms.json exists with valid frames)
+    if [ "$SKIP_COLMAP" = "false" ] && check_transforms_exists "$INPUT_FOLDER"; then
+        log_info "Detected existing transforms.json with valid frames, automatically skipping COLMAP steps"
+        SKIP_COLMAP=true
+        EXTRA_ARGS="$EXTRA_ARGS --skip_colmap"
+    elif [ "$SKIP_COLMAP" = "false" ] && [ -f "$INPUT_FOLDER/transforms.json" ]; then
+        log_warn "transforms.json exists but has no frames - COLMAP will be run to generate poses"
     fi
 
     # Handle restart

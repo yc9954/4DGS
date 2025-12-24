@@ -150,24 +150,44 @@ class Pipeline:
 
     def _check_transforms_exists(self) -> bool:
         """
-        Check if transforms.json already exists in the input directory.
+        Check if transforms.json already exists with valid frames data.
 
         This is used to skip COLMAP steps for datasets that already have poses.
 
         Returns:
-            True if transforms.json exists
+            True if transforms.json exists and has valid frames
         """
+        import json
+        
         # Check in input directory
         input_transforms = self.config.input_dir / "transforms.json"
         if input_transforms.exists():
-            logger.info(f"Found existing transforms.json at: {input_transforms}")
-            return True
+            try:
+                with open(input_transforms, 'r') as f:
+                    data = json.load(f)
+                    frames = data.get('frames', [])
+                    if frames and len(frames) > 0:
+                        logger.info(f"Found existing transforms.json with {len(frames)} frames at: {input_transforms}")
+                        return True
+                    else:
+                        logger.warning(f"transforms.json exists but has no frames at: {input_transforms}")
+            except Exception as e:
+                logger.warning(f"Error reading transforms.json: {e}")
 
         # Check in experiment directory
         exp_transforms = self.config.get_experiment_dir() / "transforms.json"
         if exp_transforms.exists():
-            logger.info(f"Found existing transforms.json at: {exp_transforms}")
-            return True
+            try:
+                with open(exp_transforms, 'r') as f:
+                    data = json.load(f)
+                    frames = data.get('frames', [])
+                    if frames and len(frames) > 0:
+                        logger.info(f"Found existing transforms.json with {len(frames)} frames at: {exp_transforms}")
+                        return True
+                    else:
+                        logger.warning(f"transforms.json exists but has no frames at: {exp_transforms}")
+            except Exception as e:
+                logger.warning(f"Error reading transforms.json: {e}")
 
         return False
 
@@ -255,7 +275,7 @@ class Pipeline:
 
     def step_preprocess(self) -> dict:
         """
-        Step 1: Extract frames from videos.
+        Step 1: Extract frames from videos or use existing images.
 
         Returns:
             Dictionary with extraction results
@@ -263,6 +283,42 @@ class Pipeline:
         logger.info("=" * 60)
         logger.info("STEP 1: FRAME EXTRACTION")
         logger.info("=" * 60)
+
+        # Check if images already exist
+        input_images_dir = self.config.input_dir / "images"
+        if input_images_dir.exists() and any(input_images_dir.glob("*.png")) or any(input_images_dir.glob("*.jpg")):
+            logger.info(f"Found existing images in {input_images_dir}, skipping video extraction")
+            
+            # Copy images to experiment directory structure
+            exp_dir = self.config.get_experiment_dir()
+            exp_input_dir = exp_dir / "input" / "cam00" / "images"
+            exp_input_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Copy all images
+            import shutil
+            for img_file in input_images_dir.glob("*.png"):
+                shutil.copy2(img_file, exp_input_dir / img_file.name)
+            for img_file in input_images_dir.glob("*.jpg"):
+                shutil.copy2(img_file, exp_input_dir / img_file.name)
+            
+            logger.info(f"Copied {len(list(exp_input_dir.glob('*')))} images to {exp_input_dir}")
+            
+            # Create results structure
+            results = {
+                "cam00": {
+                    "output_dir": exp_input_dir.parent,
+                    "frame_count": len(list(exp_input_dir.glob("*")))
+                }
+            }
+            
+            # Create symlinks for COLMAP
+            self.frame_extractor.create_frame_symlinks(results)
+            
+            # [FIX] Create 'images' symlink so training script can find frames
+            self._link_images_for_training()
+            
+            logger.info(f"Using existing images from {len(results)} camera(s)")
+            return results
 
         # Discover and extract videos
         results = self.frame_extractor.extract_all_videos()
@@ -503,6 +559,9 @@ class Pipeline:
 
             # Training and rendering (always run if requested)
             if "train" in steps:
+                # Ensure transforms.json is copied if we skipped COLMAP steps
+                if skip_colmap_steps:
+                    self._copy_transforms_if_needed()
                 results["train"] = self.step_train(mock=mock_training)
 
             if "render" in steps:
