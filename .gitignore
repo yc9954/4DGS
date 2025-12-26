@@ -48,38 +48,54 @@ htmlcov/
 .pytest_cache/
 .mypy_cache/
 
-# Data directories (large files)
-data/inputs/
-data/processed/
-data/outputs/
-
-# But keep the directory structure
+# ============================================================================
+# Data directories - Keep structure, ignore large files
+# ============================================================================
+# Keep directory structure with .gitkeep
+data/inputs/*
 !data/inputs/.gitkeep
+
+data/processed/*
 !data/processed/.gitkeep
+
+data/outputs/*
 !data/outputs/.gitkeep
 
-# COLMAP outputs
+# ============================================================================
+# Large binary files (ignored everywhere)
+# ============================================================================
+# COLMAP database files
 *.db
 *.db-journal
-sparse/
-dense/
 
-# Model outputs
+# 3D model files
 *.ply
 *.pth
-point_cloud/
+*.pt
+*.ckpt
 
-# Rendered outputs
+# Video files
 *.mp4
 *.avi
 *.mov
 *.webm
+*.mkv
 
+# ============================================================================
 # Logs
-logs/
+# ============================================================================
+logs/*
+!logs/.gitkeep
 *.log
 
-# OS
+# ============================================================================
+# Pipeline state (resume data)
+# ============================================================================
+.pipeline_state/
+
+# ============================================================================
+# OS files
+# ============================================================================
 .DS_Store
 Thumbs.db
 
