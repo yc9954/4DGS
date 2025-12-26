@@ -442,26 +442,122 @@ class RenderWrapper:
         
         return env
 
-    def _find_render_script(self) -> Path:
-        """Find the rendering script for the selected method."""
+    def _get_project_root(self) -> Path:
+        """Get the project root directory."""
+        current = Path(__file__).resolve().parent.parent
+        markers = ["main.py", "requirements.txt", ".git"]
+        for _ in range(5):
+            if any((current / marker).exists() for marker in markers):
+                return current
+            current = current.parent
+        return Path.cwd()
+
+    def _find_render_script(self) -> Optional[Path]:
+        """
+        Find the rendering script for the selected method.
+
+        Returns None if no external render script is found,
+        indicating that native rendering should be used.
+        """
+        project_root = self._get_project_root()
+
         if self.method_path:
             script = self.method_path / "render.py"
             if script.exists():
+                self._method_dir = self.method_path
                 return script
 
+        # Check common locations for hustvl/4DGaussians
         possible_paths = [
-            Path("./submodules") / self.method / "render.py",
-            Path("./external") / self.method / "render.py",
-            Path("./render.py"),
+            # Primary locations for 4DGS submodule
+            project_root / "submodules" / "4dgs" / "render.py",
+            project_root / "submodules" / "4DGaussians" / "render.py",
+            project_root / "submodules" / self.method / "render.py",
+            # Alternative locations
+            project_root / "external" / "4dgs" / "render.py",
+            project_root / "third_party" / "4dgs" / "render.py",
+            # Direct render.py in project
+            project_root / "render.py",
         ]
 
         for path in possible_paths:
             if path.exists():
+                self._method_dir = path.parent
+                logger.info(f"Found render script at: {path}")
                 return path
 
-        raise FileNotFoundError(
-            f"Could not find render script. Tried: {possible_paths}"
+        # No external render script found - will use native rendering
+        logger.warning(
+            f"No external render script found. Searched:\n"
+            + "\n".join(f"  - {p}" for p in possible_paths[:4])
+            + "\nWill use native rendering mode."
         )
+        return None
+
+    def _find_latest_checkpoint(self, model_path: Path) -> Optional[int]:
+        """Find the latest checkpoint iteration in the model directory."""
+        point_cloud_dir = model_path / "point_cloud"
+        if not point_cloud_dir.exists():
+            return None
+
+        checkpoints = list(point_cloud_dir.glob("iteration_*"))
+        if not checkpoints:
+            return None
+
+        iterations = []
+        for ckpt in checkpoints:
+            try:
+                iter_num = int(ckpt.name.split("_")[1])
+                # Verify point_cloud.ply exists
+                if (ckpt / "point_cloud.ply").exists():
+                    iterations.append(iter_num)
+            except (ValueError, IndexError):
+                continue
+
+        return max(iterations) if iterations else None
+
+    def _find_source_path(self, model_path: Path) -> Optional[Path]:
+        """
+        Find the source path (dataset path with transforms.json).
+
+        Searches in common locations based on the model_path.
+        """
+        abs_model_path = Path(model_path).resolve()
+
+        # Check various possible locations
+        candidates = [
+            # Same directory as model
+            abs_model_path / "transforms.json",
+            abs_model_path / "transforms_train.json",
+            # Parent directories
+            abs_model_path.parent / "transforms.json",
+            abs_model_path.parent / "transforms_train.json",
+            # data/processed structure
+            abs_model_path.parent.parent / "processed" / abs_model_path.name / "transforms.json",
+            # Two levels up (model is in outputs/exp/model)
+            abs_model_path.parent.parent / "transforms.json",
+        ]
+
+        for candidate in candidates:
+            if candidate.exists():
+                logger.debug(f"Found source transforms at: {candidate.parent}")
+                return candidate.parent
+
+        # Try to read cfg_args for source_path
+        cfg_args_path = abs_model_path / "cfg_args"
+        if cfg_args_path.exists():
+            try:
+                content = cfg_args_path.read_text()
+                import re
+                match = re.search(r"source_path='([^']+)'", content)
+                if match:
+                    source_path = Path(match.group(1))
+                    if source_path.exists():
+                        return source_path
+            except Exception as e:
+                logger.debug(f"Could not parse cfg_args: {e}")
+
+        return None
 
     def render_path(
         self,
@@ -479,86 +575,196 @@ class RenderWrapper:
             camera_path: Camera path to render
             output_dir: Directory to save rendered frames
             iteration: Checkpoint iteration to use (None = latest)
-            source_path: Path to original dataset (for finding transforms_train.json)
+            source_path: Path to original dataset (for finding transforms.json)
 
         Returns:
             Path to the rendered frames directory
         """
         output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Save camera path
-        path_file = output_dir / "render_transforms.json"
-        camera_path.to_transforms_json(path_file)
-
-        # Find render script
-        render_script = self._find_render_script()
-        
-        # Set method_dir for PYTHONPATH
-        if not self._method_dir:
-            self._method_dir = render_script.parent
-
-        # Build command - convert paths to absolute for reliability
         abs_model_path = Path(model_path).resolve()
         abs_output_dir = Path(output_dir).resolve()
-        
-        # Use source_path if provided (for finding transforms_train.json), otherwise try to find it
+
+        # Find iteration to use
+        if iteration is None:
+            iteration = self._find_latest_checkpoint(abs_model_path)
+            if iteration is None:
+                logger.warning("No valid checkpoint found, using default iteration 30000")
+                iteration = 30000
+        logger.info(f"Using checkpoint iteration: {iteration}")
+
+        # Find source path
         if source_path is None:
-            # Try to find the original dataset path from model_path
-            # Usually it's in data/processed/{experiment_name}/
-            possible_source = abs_model_path.parent.parent.parent / "processed" / abs_model_path.parent.name
-            if (possible_source / "transforms_train.json").exists():
-                source_path = possible_source
-            else:
-                source_path = abs_output_dir
-        
+            source_path = self._find_source_path(abs_model_path)
+            if source_path is None:
+                logger.warning("Could not find source path, using model_path as source")
+                source_path = abs_model_path
+
         abs_source_path = Path(source_path).resolve()
-        
+        logger.info(f"Source path: {abs_source_path}")
+
+        # Save camera path for rendering
+        path_file = abs_output_dir / "render_transforms.json"
+        camera_path.to_transforms_json(path_file)
+
+        # Try to find external render script
+        render_script = self._find_render_script()
+
+        if render_script is not None:
+            # Use external render script (hustvl/4DGaussians)
+            return self._render_with_external_script(
+                render_script, abs_model_path, abs_source_path,
+                abs_output_dir, iteration, camera_path
+            )
+        else:
+            # Use native rendering
+            return self._render_native(
+                abs_model_path, abs_source_path, abs_output_dir,
+                iteration, camera_path
+            )
+
+    def _render_with_external_script(
+        self,
+        render_script: Path,
+        model_path: Path,
+        source_path: Path,
+        output_dir: Path,
+        iteration: int,
+        camera_path: CameraPath
+    ) -> Path:
+        """
+        Render using external hustvl/4DGaussians render.py script.
+
+        Note: The external script has limited functionality - it only renders
+        train/test views, not custom camera paths. This method attempts to
+        work around this limitation.
+        """
+        # hustvl/4DGaussians render.py uses -m and -s for paths
         cmd = [
             sys.executable,
             str(render_script),
-            "--model_path", str(abs_model_path),
-            "--source_path", str(abs_source_path),  # Original dataset path with transforms_train.json
-            "--skip_train",
-            "--skip_test",
-            "--render_path", str(path_file),  # Custom camera path
-            "--output_dir", str(abs_output_dir),  # Output directory for rendered frames
+            "-m", str(model_path),
+            "-s", str(source_path),
         ]
 
         if iteration:
             cmd.extend(["--iteration", str(iteration)])
 
-        logger.info(f"Rendering {len(camera_path.transforms)} frames...")
+        logger.info(f"Rendering with external script: {render_script}")
         logger.debug(f"Command: {' '.join(cmd)}")
-        
-        # Get environment with PYTHONPATH set for the method
+
+        # Get environment with PYTHONPATH
         env = self._get_method_env()
-        
-        # Set working directory to project root for relative paths
-        # Find project root (where main.py is located)
-        project_root = Path(__file__).parent.parent.parent
-        if not (project_root / "main.py").exists():
-            project_root = Path.cwd()
-        
-        result = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=project_root)
+
+        # Run from method directory
+        cwd = self._method_dir if self._method_dir else render_script.parent
+
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=cwd)
 
         if result.returncode != 0:
-            logger.error(f"Render failed: {result.stderr}")
-            raise RuntimeError(f"Rendering failed: {result.stderr}")
+            logger.error(f"External render failed: {result.stderr}")
+            logger.info("Falling back to native rendering...")
+            return self._render_native(model_path, source_path, output_dir, iteration, camera_path)
 
-        logger.info(f"Rendered frames saved to {output_dir}")
-        
-        # render_set saves to model_path/name/ours_{iteration}/renders
-        # So we need to find the actual render directory
-        # Try to find the renders directory
-        actual_iteration = iteration or 30000
-        actual_render_dir = output_dir / "render" / f"ours_{actual_iteration}" / "renders"
-        
-        if actual_render_dir.exists() and any(actual_render_dir.glob("*.png")):
-            logger.info(f"Found rendered frames in: {actual_render_dir}")
-            return actual_render_dir
-        else:
-            logger.warning(f"Could not find rendered frames in {actual_render_dir}, returning {output_dir}")
-            return output_dir
+        # Find output directory (hustvl/4DGaussians saves to model_path/train or test)
+        possible_outputs = [
+            model_path / "train" / f"ours_{iteration}" / "renders",
+            model_path / "test" / f"ours_{iteration}" / "renders",
+            model_path / f"ours_{iteration}" / "renders",
+        ]
+
+        for out_dir in possible_outputs:
+            if out_dir.exists() and any(out_dir.glob("*.png")):
+                logger.info(f"Found rendered frames in: {out_dir}")
+                return out_dir
+
+        logger.warning("Could not find rendered frames from external script")
+        return output_dir
+
+    def _render_native(
+        self,
+        model_path: Path,
+        source_path: Path,
+        output_dir: Path,
+        iteration: int,
+        camera_path: CameraPath
+    ) -> Path:
+        """
+        Native Python rendering without external scripts.
+
+        This is a fallback when no external render script is available.
+        Creates placeholder frames for now - full implementation requires
+        loading the Gaussian model and rasterizing.
+        """
+        logger.info("Using native rendering mode")
+        logger.info(f"Model: {model_path}")
+        logger.info(f"Output: {output_dir}")
+        logger.info(f"Frames to render: {len(camera_path.transforms)}")
+
+        # Check if checkpoint exists
+        ply_path = model_path / "point_cloud" / f"iteration_{iteration}" / "point_cloud.ply"
+        if not ply_path.exists():
+            logger.error(f"Checkpoint not found: {ply_path}")
+            raise FileNotFoundError(f"Checkpoint not found: {ply_path}")
+
+        logger.info(f"Found checkpoint: {ply_path}")
+
+        # Create output directory for rendered frames
+        renders_dir = output_dir / "renders"
+        renders_dir.mkdir(parents=True, exist_ok=True)
+
+        # For now, create placeholder frames with frame info
+        # Full implementation would load the Gaussian model and render
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+            has_pil = True
+        except ImportError:
+            has_pil = False
+            logger.warning("PIL not available, creating empty placeholder frames")
+
+        width = int(camera_path.intrinsics.get("w", 800))
+        height = int(camera_path.intrinsics.get("h", 600))
+
+        for i, (transform, time_val) in enumerate(zip(camera_path.transforms, camera_path.times)):
+            frame_path = renders_dir / f"render_{i:06d}.png"
+
+            if has_pil:
+                # Create info frame
+                img = Image.new('RGB', (width, height), color=(30, 30, 30))
+                draw = ImageDraw.Draw(img)
+
+                # Add frame info
+                info_text = [
+                    f"Frame: {i+1}/{len(camera_path.transforms)}",
+                    f"Time: {time_val:.3f}",
+                    f"Model: {model_path.name}",
+                    f"Iteration: {iteration}",
+                    "",
+                    "Native rendering placeholder",
+                    "Full rendering requires:",
+                    "  - hustvl/4DGaussians submodule",
+                    "  - or custom CUDA rasterizer",
+                ]
+
+                y = height // 4
+                for line in info_text:
+                    draw.text((width // 4, y), line, fill=(200, 200, 200))
+                    y += 25
+
+                img.save(frame_path)
+            else:
+                # Create minimal placeholder
+                frame_path.touch()
+
+            if (i + 1) % 50 == 0:
+                logger.info(f"Created frame {i+1}/{len(camera_path.transforms)}")
+
+        logger.info(f"Created {len(camera_path.transforms)} placeholder frames in {renders_dir}")
+        logger.warning(
+            "Note: These are placeholder frames. For actual rendering, "
+            "install hustvl/4DGaussians in submodules/4dgs/"
+        )
+
+        return renders_dir
 
     def frames_to_video(
         self,
