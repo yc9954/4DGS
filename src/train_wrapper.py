@@ -537,6 +537,18 @@ class TrainWrapper:
             # Save training metadata
             self._save_training_metadata(model_path, elapsed)
 
+            # Save cfg_args for rendering (if not already saved by training script)
+            self._save_cfg_args(model_path, source_path)
+
+            # Verify checkpoints were saved
+            has_checkpoints = self._verify_checkpoints(model_path)
+            if not has_checkpoints:
+                logger.warning(
+                    "No checkpoints found after training! "
+                    "This may indicate a problem with the training script. "
+                    "Check the training log for errors."
+                )
+
             return model_path
 
         except KeyboardInterrupt:
@@ -577,6 +589,99 @@ class TrainWrapper:
             json.dump(metadata, f, indent=2)
 
         logger.debug(f"Saved training metadata to {metadata_path}")
+
+    def _save_cfg_args(self, model_path: Path, source_path: Path):
+        """
+        Save cfg_args file required for rendering.
+
+        The cfg_args file contains model configuration that the render script
+        needs to properly load and render the trained model.
+
+        Args:
+            model_path: Path to the model output directory
+            source_path: Path to the training data source
+        """
+        cfg_args_path = model_path / "cfg_args"
+
+        # If cfg_args already exists (created by training script), don't overwrite
+        if cfg_args_path.exists():
+            logger.debug(f"cfg_args already exists at {cfg_args_path}")
+            return
+
+        # Create cfg_args in the format expected by 4DGS render.py
+        # This uses a simple Namespace-like format that can be parsed
+        cfg_content = f"""Namespace(
+    sh_degree=3,
+    source_path='{source_path.resolve()}',
+    model_path='{model_path.resolve()}',
+    images='images',
+    resolution={self.train_config.resolution if self.train_config.resolution != -1 else -1},
+    white_background={self.train_config.white_background},
+    data_device='cuda',
+    eval=False
+)"""
+
+        with open(cfg_args_path, 'w') as f:
+            f.write(cfg_content)
+
+        logger.info(f"Created cfg_args at {cfg_args_path}")
+
+    def _verify_checkpoints(self, model_path: Path) -> bool:
+        """
+        Verify that checkpoints were saved properly.
+
+        Args:
+            model_path: Path to the model output directory
+
+        Returns:
+            True if at least one checkpoint exists
+        """
+        point_cloud_dir = model_path / "point_cloud"
+
+        if not point_cloud_dir.exists():
+            logger.warning(f"point_cloud directory does not exist: {point_cloud_dir}")
+            # Try to create it for future saves
+            point_cloud_dir.mkdir(parents=True, exist_ok=True)
+            return False
+
+        # Check for iteration subdirectories
+        checkpoints = list(point_cloud_dir.glob("iteration_*"))
+
+        if not checkpoints:
+            logger.warning(f"No checkpoint iterations found in {point_cloud_dir}")
+            return False
+
+        # Verify each checkpoint has point_cloud.ply
+        valid_checkpoints = []
+        for ckpt_dir in checkpoints:
+            ply_file = ckpt_dir / "point_cloud.ply"
+            if ply_file.exists():
+                valid_checkpoints.append(ckpt_dir.name)
+                logger.debug(f"Found valid checkpoint: {ckpt_dir.name}")
+            else:
+                logger.warning(f"Checkpoint {ckpt_dir.name} missing point_cloud.ply")
+
+        if valid_checkpoints:
+            logger.info(f"Found {len(valid_checkpoints)} valid checkpoint(s): {valid_checkpoints}")
+            return True
+        else:
+            logger.warning("No valid checkpoints found with point_cloud.ply")
+            return False
+
+    def _create_empty_checkpoint(self, model_path: Path, iteration: int):
+        """
+        Create an empty checkpoint structure for testing/debugging.
+
+        Note: This creates a minimal structure, actual training data
+        must be saved by the training script.
+
+        Args:
+            model_path: Path to the model output directory
+            iteration: Iteration number for the checkpoint
+        """
+        ckpt_dir = model_path / "point_cloud" / f"iteration_{iteration}"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        logger.debug(f"Created checkpoint directory: {ckpt_dir}")
 
     def resume_training(
         self,
@@ -674,13 +779,35 @@ class MockTrainWrapper(TrainWrapper):
 
             time.sleep(0.1)  # Small delay to simulate
 
-        # Create mock output
-        (model_path / "point_cloud").mkdir(exist_ok=True)
-        (model_path / "point_cloud" / "iteration_30000").mkdir(exist_ok=True)
+        # Create mock output with proper structure
+        point_cloud_dir = model_path / "point_cloud" / f"iteration_{self.train_config.iterations}"
+        point_cloud_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save mock checkpoint info
-        with open(model_path / "cfg_args", 'w') as f:
-            f.write("Mock training completed\n")
+        # Create a minimal mock point_cloud.ply
+        mock_ply_path = point_cloud_dir / "point_cloud.ply"
+        mock_ply_content = """ply
+format ascii 1.0
+element vertex 100
+property float x
+property float y
+property float z
+property float nx
+property float ny
+property float nz
+property uchar red
+property uchar green
+property uchar blue
+end_header
+"""
+        # Add some dummy vertices
+        for i in range(100):
+            mock_ply_content += f"{i*0.01} {i*0.01} {i*0.01} 0 0 1 128 128 128\n"
+
+        with open(mock_ply_path, 'w') as f:
+            f.write(mock_ply_content)
+
+        # Save cfg_args using the proper method
+        self._save_cfg_args(model_path, source_path)
 
         self._save_training_metadata(model_path, 1.0)
 
