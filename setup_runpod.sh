@@ -155,6 +155,7 @@ setup_python_env() {
 
     # Ensure pip is up to date
     log_info "Upgrading pip..."
+    python3 -m pip install --upgrade pip setuptools wheel --ignore-installed 2>/dev/null || \
     python3 -m pip install --upgrade pip setuptools wheel
 
     # Detect CUDA version and install appropriate PyTorch
@@ -200,12 +201,17 @@ setup_python_env() {
 
     if [ -f "$REQUIREMENTS_FILE" ]; then
         log_info "Installing Python dependencies from requirements.txt..."
-        python3 -m pip install -r "$REQUIREMENTS_FILE"
+        # Use --ignore-installed to avoid distutils package conflicts
+        # (e.g., blinker, pyparsing that come with system Python)
+        python3 -m pip install --ignore-installed -r "$REQUIREMENTS_FILE" || {
+            log_warn "Some packages failed with --ignore-installed, trying without..."
+            python3 -m pip install -r "$REQUIREMENTS_FILE" --no-deps || true
+        }
     else
         log_warn "requirements.txt not found at $REQUIREMENTS_FILE"
         log_info "Installing core dependencies manually..."
-        python3 -m pip install numpy scipy opencv-python-headless pillow tqdm loguru pyyaml
-        python3 -m pip install mmcv==1.6.0 lpips plyfile pytorch_msssim open3d imageio[ffmpeg]
+        python3 -m pip install --ignore-installed numpy scipy opencv-python-headless pillow tqdm loguru pyyaml || true
+        python3 -m pip install --ignore-installed plyfile imageio || true
     fi
 
     # Verify PyTorch CUDA availability
