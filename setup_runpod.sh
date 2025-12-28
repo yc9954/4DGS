@@ -288,13 +288,25 @@ build_cuda_extensions() {
 
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-    # Check for gaussian-splatting submodule with diff-gaussian-rasterization
-    RASTERIZER_DIR="$SCRIPT_DIR/submodules/4dgs/submodules/diff-gaussian-rasterization"
+    # Check for gaussian-splatting submodule with depth-diff-gaussian-rasterization
+    # Note: hustvl/4DGaussians uses depth-diff-gaussian-rasterization (not diff-gaussian-rasterization)
+    RASTERIZER_DIR="$SCRIPT_DIR/submodules/4dgs/submodules/depth-diff-gaussian-rasterization"
     if [ -d "$RASTERIZER_DIR" ]; then
-        log_info "Building diff-gaussian-rasterization..."
+        log_info "Building depth-diff-gaussian-rasterization..."
         cd "$RASTERIZER_DIR"
-        python3 -m pip install -e .
+        # Use --no-build-isolation to prevent pip from creating isolated build environments
+        # This is required for CUDA extensions that need access to system CUDA installation
+        python3 -m pip install -e . --no-build-isolation
         cd "$SCRIPT_DIR"
+    else
+        # Fallback to diff-gaussian-rasterization (older naming)
+        RASTERIZER_DIR="$SCRIPT_DIR/submodules/4dgs/submodules/diff-gaussian-rasterization"
+        if [ -d "$RASTERIZER_DIR" ]; then
+            log_info "Building diff-gaussian-rasterization..."
+            cd "$RASTERIZER_DIR"
+            python3 -m pip install -e . --no-build-isolation
+            cd "$SCRIPT_DIR"
+        fi
     fi
 
     # Check for simple-knn
@@ -302,11 +314,150 @@ build_cuda_extensions() {
     if [ -d "$SIMPLE_KNN_DIR" ]; then
         log_info "Building simple-knn..."
         cd "$SIMPLE_KNN_DIR"
-        python3 -m pip install -e .
+        python3 -m pip install -e . --no-build-isolation
         cd "$SCRIPT_DIR"
     fi
 
     log_info "CUDA extensions built successfully."
+}
+
+# ============================================================================
+# Patch 4DGS Code for RunPod Compatibility
+# ============================================================================
+patch_4dgs_code() {
+    log_section "Patching 4DGS Code for RunPod/Headless Environment"
+
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    DGS_DIR="$SCRIPT_DIR/submodules/4dgs"
+
+    if [ ! -d "$DGS_DIR" ]; then
+        log_warn "4DGS directory not found, skipping patches"
+        return 0
+    fi
+
+    # ========================================================================
+    # Patch 1: Remove tkinter import from deformation.py (headless fix)
+    # ========================================================================
+    DEFORMATION_FILE="$DGS_DIR/scene/deformation.py"
+    if [ -f "$DEFORMATION_FILE" ]; then
+        if grep -q "from tkinter import" "$DEFORMATION_FILE"; then
+            log_info "Patching deformation.py: removing tkinter import..."
+            # Replace 'from tkinter import W' with 'W = "w"' (the constant is just a string)
+            sed -i 's/from tkinter import W/W = "w"  # Patched: removed tkinter for headless/' "$DEFORMATION_FILE"
+            log_info "  ✓ Removed tkinter import from deformation.py"
+        else
+            log_info "  ✓ deformation.py already patched or doesn't need patching"
+        fi
+    fi
+
+    # ========================================================================
+    # Patch 2: Add transforms.json support to scene/__init__.py
+    # ========================================================================
+    SCENE_INIT_FILE="$DGS_DIR/scene/__init__.py"
+    if [ -f "$SCENE_INIT_FILE" ]; then
+        if ! grep -q "transforms.json" "$SCENE_INIT_FILE"; then
+            log_info "Patching scene/__init__.py: adding transforms.json support..."
+            # Add transforms.json check before the scene type error
+            sed -i 's/raise Exception("Could not recognize scene type!")/# Check for transforms.json (NeRF synthetic format)\n            elif os.path.exists(os.path.join(args.source_path, "transforms.json")):\n                print("Found transforms.json, using NeRF synthetic format")\n                scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)\n            else:\n                raise Exception("Could not recognize scene type!")/' "$SCENE_INIT_FILE"
+            log_info "  ✓ Added transforms.json support to scene/__init__.py"
+        else
+            log_info "  ✓ scene/__init__.py already has transforms.json support"
+        fi
+    fi
+
+    # ========================================================================
+    # Patch 3: Fix double extension bug in dataset_readers.py
+    # ========================================================================
+    DATASET_READERS_FILE="$DGS_DIR/scene/dataset_readers.py"
+    if [ -f "$DATASET_READERS_FILE" ]; then
+        log_info "Patching dataset_readers.py: checking for double extension bug..."
+        # This is a complex fix, we'll use Python for precise patching
+        export DATASET_READERS_FILE
+        python3 << 'PYEOF'
+import re
+import os
+
+file_path = os.environ.get('DATASET_READERS_FILE')
+if not os.path.exists(file_path):
+    print(f"  File not found: {file_path}")
+    exit(0)
+
+with open(file_path, 'r') as f:
+    content = f.read()
+
+# Check if already patched
+if "# Patched: avoid double extension" in content:
+    print("  ✓ dataset_readers.py already patched for double extension")
+    exit(0)
+
+# Pattern to find image saving that might cause double extension
+# Original: image_path = os.path.join(images_folder, image_name + extension)
+# Should be: check if extension already in image_name
+
+modified = False
+
+# Fix 1: In readCamerasFromTransforms - check if file_path already has extension
+old_pattern = r"file_path = os\.path\.join\(path, frame\[\"file_path\"\]\)"
+new_pattern = '''file_path = os.path.join(path, frame["file_path"])
+        # Patched: avoid double extension - check if extension exists
+        if not os.path.exists(file_path) and not file_path.endswith(extension):
+            file_path = file_path + extension'''
+
+if re.search(old_pattern, content):
+    content = re.sub(old_pattern, new_pattern, content)
+    modified = True
+
+if modified:
+    with open(file_path, 'w') as f:
+        f.write(content)
+    print("  ✓ Patched dataset_readers.py for double extension bug")
+else:
+    print("  ✓ dataset_readers.py pattern not found (may be different version)")
+PYEOF
+    fi
+
+    # ========================================================================
+    # Patch 4: Ensure final iteration saves checkpoint in train.py
+    # ========================================================================
+    TRAIN_FILE="$DGS_DIR/train.py"
+    if [ -f "$TRAIN_FILE" ]; then
+        log_info "Patching train.py: ensuring final iteration checkpoint save..."
+        # Use Python for complex patching
+        export TRAIN_FILE
+        python3 << 'PYEOF'
+import os
+import re
+
+file_path = os.environ.get('TRAIN_FILE')
+if not os.path.exists(file_path):
+    print(f"  File not found: {file_path}")
+    exit(0)
+
+with open(file_path, 'r') as f:
+    content = f.read()
+
+# Check if already patched
+if "# Patched: also save at final iteration" in content:
+    print("  ✓ train.py already patched for final iteration save")
+    exit(0)
+
+# Pattern: "if (iteration in saving_iterations):"
+# Should become: "if (iteration in saving_iterations) or (iteration == opt.iterations):"
+
+old_pattern = r"if\s*\(\s*iteration\s+in\s+saving_iterations\s*\)\s*:"
+new_pattern = "if (iteration in saving_iterations) or (iteration == opt.iterations):  # Patched: also save at final iteration"
+
+if re.search(old_pattern, content):
+    content = re.sub(old_pattern, new_pattern, content)
+    with open(file_path, 'w') as f:
+        f.write(content)
+    print("  ✓ Patched train.py for final iteration checkpoint save")
+else:
+    print("  ! Could not find save iteration pattern in train.py (may be different version)")
+PYEOF
+    fi
+
+    log_info "4DGS code patching completed."
 }
 
 # ============================================================================
@@ -505,6 +656,7 @@ main() {
     if [ "$SKIP_SUBMODULES" = false ]; then
         setup_submodules
         build_cuda_extensions
+        patch_4dgs_code
     fi
 
     create_directories

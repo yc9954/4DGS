@@ -19,7 +19,6 @@ import time
 import threading
 import json
 from pathlib import Path
-from pathlib import Path
 from typing import Optional, List, Dict, Any, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -267,24 +266,18 @@ class TrainWrapper:
             "--iterations", str(self.train_config.iterations),
         ])
 
-        # Save iterations - hustvl uses space-separated list
+        # Save iterations - hustvl uses nargs='*' so all values follow one --save_iterations
         if self.train_config.save_iterations:
-            if self.method in ["4dgs", "4dgaussians"]:
-                # hustvl/4DGaussians format
-                for iteration in self.train_config.save_iterations:
-                    cmd.extend(["--save_iterations", str(iteration)])
-            else:
-                save_iters = " ".join(str(i) for i in self.train_config.save_iterations)
-                cmd.extend(["--save_iterations", save_iters])
+            # hustvl/4DGaussians uses argparse with nargs='*'
+            # Format: --save_iterations 1000 7000 30000
+            save_iters = [str(i) for i in self.train_config.save_iterations]
+            cmd.extend(["--save_iterations"] + save_iters)
 
-        # Test iterations
+        # Test iterations - same format as save_iterations
         if self.train_config.test_iterations:
-            if self.method in ["4dgs", "4dgaussians"]:
-                for iteration in self.train_config.test_iterations:
-                    cmd.extend(["--test_iterations", str(iteration)])
-            else:
-                test_iters = " ".join(str(i) for i in self.train_config.test_iterations)
-                cmd.extend(["--test_iterations", test_iters])
+            # Format: --test_iterations 1000 7000 30000
+            test_iters = [str(i) for i in self.train_config.test_iterations]
+            cmd.extend(["--test_iterations"] + test_iters)
 
         # Resolution
         if self.train_config.resolution != -1:
