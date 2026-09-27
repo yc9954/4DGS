@@ -8,10 +8,6 @@
 </p>
 
 <p align="center">
-  <sub><a href="docs/readme/README.ko.md">한국어</a></sub>
-</p>
-
-<p align="center">
   <strong>Multi-view video in, a trained 4D Gaussian Splatting model and a rendered fly-through out.</strong><br/>
   One command runs frame extraction, COLMAP pose estimation, conversion to <code>transforms.json</code>,<br/>
   training with <a href="https://github.com/hustvl/4DGaussians">hustvl/4DGaussians</a> and rendering along an interpolated, spiral or orbit camera path,<br/>
