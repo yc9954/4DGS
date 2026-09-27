@@ -143,14 +143,19 @@ class Camera:
 
         x, y, z = point_cam[:3]
 
-        if z <= 0:
-            return -1, -1, z  # Behind camera
+        # transforms.json poses (and CameraPathGenerator) use the NeRF / OpenGL
+        # convention: the camera looks down -z with +y up, so depth is -z and
+        # image rows grow downwards (flip y).
+        depth = -z
+
+        if depth <= 0:
+            return -1, -1, depth  # Behind camera
 
         # Project to image plane
-        u = self.fx * x / z + self.cx
-        v = self.fy * y / z + self.cy
+        u = self.fx * x / depth + self.cx
+        v = -self.fy * y / depth + self.cy
 
-        return u, v, z
+        return u, v, depth
 
 
 class PLYLoader:

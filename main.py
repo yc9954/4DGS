@@ -435,10 +435,11 @@ class Pipeline:
         # Progress callback
         def on_progress(progress):
             if progress.current_iteration % 1000 == 0:
+                loss_str = f"{progress.loss:.4f}" if progress.loss is not None else "N/A"
                 logger.info(
                     f"Training: {progress.current_iteration}/{progress.total_iterations} "
                     f"({progress.progress_percent:.1f}%) "
-                    f"Loss: {progress.loss:.4f if progress.loss else 'N/A'}"
+                    f"Loss: {loss_str}"
                 )
 
         # Run training
